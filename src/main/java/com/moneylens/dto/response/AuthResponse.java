@@ -33,12 +33,14 @@ public class AuthResponse {
         private String email;
         private String role;
         private boolean emailVerified;
+        private boolean hasStatement;
 
         public UUID getId() { return id; }
         public String getFullName() { return fullName; }
         public String getEmail() { return email; }
         public String getRole() { return role; }
         public boolean isEmailVerified() { return emailVerified; }
+        public boolean isHasStatement() { return hasStatement; }
 
         public static Builder builder() { return new Builder(); }
 
@@ -49,6 +51,7 @@ public class AuthResponse {
             public Builder email(String v) { u.email = v; return this; }
             public Builder role(String v) { u.role = v; return this; }
             public Builder emailVerified(boolean v) { u.emailVerified = v; return this; }
+            public Builder hasStatement(boolean v) { u.hasStatement = v; return this; }
             public UserInfo build() { return u; }
         }
     }

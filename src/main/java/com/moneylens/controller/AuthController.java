@@ -3,9 +3,11 @@ package com.moneylens.controller;
 import com.moneylens.dto.request.*;
 import com.moneylens.dto.response.ApiResponse;
 import com.moneylens.dto.response.AuthResponse;
+import com.moneylens.entity.User;
+import com.moneylens.exception.UserNotFoundException;
+import com.moneylens.repository.UserRepository;
 import com.moneylens.service.AuthService;
 import jakarta.validation.Valid;
-import lombok.RequiredArgsConstructor;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
@@ -17,9 +19,11 @@ import org.springframework.web.bind.annotation.*;
 public class AuthController {
 
     private final AuthService authService;
+    private final UserRepository userRepository;
 
-    public AuthController(AuthService authService) {
+    public AuthController(AuthService authService, UserRepository userRepository) {
         this.authService = authService;
+        this.userRepository = userRepository;
     }
 
     /**
@@ -98,7 +102,7 @@ public class AuthController {
             @Valid @RequestBody PasswordRequest.ForgotPassword request) {
         authService.forgotPassword(request);
         return ResponseEntity.ok(ApiResponse.success(
-            "If this email is registered, you'll receive a password reset link shortly."));
+                "If this email is registered, you'll receive a password reset link shortly."));
     }
 
     /**
@@ -110,7 +114,7 @@ public class AuthController {
             @Valid @RequestBody PasswordRequest.ResetPassword request) {
         authService.resetPassword(request);
         return ResponseEntity.ok(ApiResponse.success(
-            "Password reset successful. Please login with your new password."));
+                "Password reset successful. Please login with your new password."));
     }
 
     /**
@@ -127,12 +131,23 @@ public class AuthController {
 
     /**
      * GET /api/v1/auth/me  [PROTECTED]
-     * Quick health check — returns 200 if the JWT is valid.
+     * Returns full profile of the authenticated user including hasStatement flag.
      */
     @GetMapping("/me")
-    public ResponseEntity<ApiResponse<String>> me(
+    public ResponseEntity<ApiResponse<AuthResponse.UserInfo>> me(
             @AuthenticationPrincipal UserDetails userDetails) {
-        return ResponseEntity.ok(ApiResponse.success(
-            "Token is valid", userDetails.getUsername()));
+        User user = userRepository.findByEmail(userDetails.getUsername())
+                .orElseThrow(() -> new UserNotFoundException("User not found"));
+
+        AuthResponse.UserInfo userInfo = AuthResponse.UserInfo.builder()
+                .id(user.getId())
+                .fullName(user.getFullName())
+                .email(user.getEmail())
+                .role(user.getRole().name())
+                .emailVerified(user.isEmailVerified())
+                .hasStatement(user.isHasStatement())
+                .build();
+
+        return ResponseEntity.ok(ApiResponse.success("User profile fetched", userInfo));
     }
 }

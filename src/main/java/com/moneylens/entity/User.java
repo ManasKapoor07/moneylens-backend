@@ -1,7 +1,6 @@
 package com.moneylens.entity;
 
 import jakarta.persistence.*;
-
 import java.time.LocalDateTime;
 import java.util.UUID;
 
@@ -31,6 +30,9 @@ public class User {
 
     @Column(name = "is_email_verified")
     private boolean emailVerified = false;
+
+    @Column(name = "has_statement")
+    private boolean hasStatement = false;
 
     @Column(name = "email_verification_token", unique = true)
     private String emailVerificationToken;
@@ -99,64 +101,29 @@ public class User {
     // ===== Getters =====
 
     public UUID getId() { return id; }
-
     public String getFullName() { return fullName; }
-
     public String getEmail() { return email; }
-
     public String getPassword() { return password; }
-
     public Role getRole() { return role; }
-
     public boolean isActive() { return active; }
-
     public boolean isEmailVerified() { return emailVerified; }
-
+    public boolean isHasStatement() { return hasStatement; }
     public String getEmailVerificationToken() { return emailVerificationToken; }
-
     public LocalDateTime getEmailVerificationTokenExpiry() { return emailVerificationTokenExpiry; }
-
     public String getPasswordResetToken() { return passwordResetToken; }
-
     public LocalDateTime getPasswordResetTokenExpiry() { return passwordResetTokenExpiry; }
-
     public LocalDateTime getLastLogin() { return lastLogin; }
-
     public LocalDateTime getCreatedAt() { return createdAt; }
 
     // ===== Setters =====
 
-    public void setId(UUID id) { this.id = id; }
-
-    public void setFullName(String fullName) { this.fullName = fullName; }
-
-    public void setEmail(String email) { this.email = email; }
-
     public void setPassword(String password) { this.password = password; }
-
-    public void setRole(Role role) { this.role = role; }
-
     public void setActive(boolean active) { this.active = active; }
-
     public void setEmailVerified(boolean emailVerified) { this.emailVerified = emailVerified; }
-
-    public void setEmailVerificationToken(String emailVerificationToken) {
-        this.emailVerificationToken = emailVerificationToken;
-    }
-
-    public void setEmailVerificationTokenExpiry(LocalDateTime emailVerificationTokenExpiry) {
-        this.emailVerificationTokenExpiry = emailVerificationTokenExpiry;
-    }
-
-    public void setPasswordResetToken(String passwordResetToken) {
-        this.passwordResetToken = passwordResetToken;
-    }
-
-    public void setPasswordResetTokenExpiry(LocalDateTime passwordResetTokenExpiry) {
-        this.passwordResetTokenExpiry = passwordResetTokenExpiry;
-    }
-
+    public void setHasStatement(boolean hasStatement) { this.hasStatement = hasStatement; }
+    public void setEmailVerificationToken(String emailVerificationToken) { this.emailVerificationToken = emailVerificationToken; }
+    public void setEmailVerificationTokenExpiry(LocalDateTime emailVerificationTokenExpiry) { this.emailVerificationTokenExpiry = emailVerificationTokenExpiry; }
+    public void setPasswordResetToken(String passwordResetToken) { this.passwordResetToken = passwordResetToken; }
+    public void setPasswordResetTokenExpiry(LocalDateTime passwordResetTokenExpiry) { this.passwordResetTokenExpiry = passwordResetTokenExpiry; }
     public void setLastLogin(LocalDateTime lastLogin) { this.lastLogin = lastLogin; }
-
-    public void setCreatedAt(LocalDateTime createdAt) { this.createdAt = createdAt; }
 }
