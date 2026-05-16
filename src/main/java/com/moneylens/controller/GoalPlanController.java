@@ -68,15 +68,18 @@ public class GoalPlanController {
             @PathVariable UUID planId,
             @RequestBody Map<String, Object> body
     ) {
-        UUID    taskId      = UUID.fromString((String) body.get("taskId"));
-        BigDecimal saved    = body.get("savedAmount") != null
+        UUID taskId        = UUID.fromString((String) body.get("taskId"));
+        BigDecimal saved   = body.get("savedAmount") != null
                 ? new BigDecimal(body.get("savedAmount").toString()) : null;
-        String  note        = (String) body.get("note");
+        String note        = (String) body.get("note");
         GoalPlanTask.CheckinStatus status = "SKIPPED".equalsIgnoreCase((String) body.get("status"))
                 ? GoalPlanTask.CheckinStatus.SKIPPED
                 : GoalPlanTask.CheckinStatus.DONE;
 
-        return ResponseEntity.ok(goalPlanService.checkIn(planId, taskId, saved, note, status));
+        // financialContext not available at controller level — service falls back
+        // to its stored diagnosis when null, so chunk auto-unlock still works
+        return ResponseEntity.ok(
+                goalPlanService.checkIn(planId, taskId, saved, note, status, null));
     }
 
     // DELETE /api/v1/plans/{planId} — abandon a plan

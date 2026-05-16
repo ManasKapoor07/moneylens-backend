@@ -170,7 +170,11 @@ public class GoalService {
     ) {}
 
     @SuppressWarnings("unchecked")
-    public GoalSuggestionResult detectGoalSuggestion(UUID userId, String conversationContext) {
+    public GoalSuggestionResult detectGoalSuggestion(
+            UUID userId,
+            String conversationContext,
+            String currentPendingGoal
+    ) {
         try {
             String existingGoalsSummary = buildExistingGoalsSummary(userId);
 

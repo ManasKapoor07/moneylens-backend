@@ -1,6 +1,7 @@
 /Users/manaskapoor/Downloads/moneylens-backend/src/main/java/com/moneylens/dto/response/WeeklySpendDto.java
 /Users/manaskapoor/Downloads/moneylens-backend/src/main/java/com/moneylens/exception/AccountDisabledException.java
 /Users/manaskapoor/Downloads/moneylens-backend/src/main/java/com/moneylens/service/AIContextBuilderService.java
+/Users/manaskapoor/Downloads/moneylens-backend/src/main/java/com/moneylens/entity/DailyTokenUsage.java
 /Users/manaskapoor/Downloads/moneylens-backend/src/main/java/com/moneylens/service/GoalPlanService.java
 /Users/manaskapoor/Downloads/moneylens-backend/src/main/java/com/moneylens/dto/response/AIAnalysisResponse.java
 /Users/manaskapoor/Downloads/moneylens-backend/src/main/java/com/moneylens/exception/InvalidCredentialsException.java
@@ -43,11 +44,13 @@
 /Users/manaskapoor/Downloads/moneylens-backend/src/main/java/com/moneylens/controller/FinancialAIController.java
 /Users/manaskapoor/Downloads/moneylens-backend/src/main/java/com/moneylens/service/PlanCreationHelper.java
 /Users/manaskapoor/Downloads/moneylens-backend/src/main/java/com/moneylens/entity/FinancialAIAnalysis.java
+/Users/manaskapoor/Downloads/moneylens-backend/src/main/java/com/moneylens/service/TokenBudgetService.java
 /Users/manaskapoor/Downloads/moneylens-backend/src/main/java/com/moneylens/service/EmailService.java
 /Users/manaskapoor/Downloads/moneylens-backend/src/main/java/com/moneylens/service/DashboardService.java
 /Users/manaskapoor/Downloads/moneylens-backend/src/main/java/com/moneylens/service/TransactionMapper.java
 /Users/manaskapoor/Downloads/moneylens-backend/src/main/java/com/moneylens/service/TransactionExtractionWorker.java
 /Users/manaskapoor/Downloads/moneylens-backend/src/main/java/com/moneylens/repository/UserGoalRepository.java
+/Users/manaskapoor/Downloads/moneylens-backend/src/main/java/com/moneylens/repository/DailyTokenUsageRepository.java
 /Users/manaskapoor/Downloads/moneylens-backend/src/main/java/com/moneylens/dto/request/RegisterRequest.java
 /Users/manaskapoor/Downloads/moneylens-backend/src/main/java/com/moneylens/service/OpenAIService.java
 /Users/manaskapoor/Downloads/moneylens-backend/src/main/java/com/moneylens/repository/UserRepository.java
@@ -61,7 +64,6 @@
 /Users/manaskapoor/Downloads/moneylens-backend/src/main/java/com/moneylens/repository/GoalPlanTaskRepository.java
 /Users/manaskapoor/Downloads/moneylens-backend/src/main/java/com/moneylens/dto/response/OpenAIResponse.java
 /Users/manaskapoor/Downloads/moneylens-backend/src/main/java/com/moneylens/dto/response/GoalDto.java
-/Users/manaskapoor/Downloads/moneylens-backend/src/main/java/com/moneylens/service/OpenAIRequest.java
 /Users/manaskapoor/Downloads/moneylens-backend/src/main/java/com/moneylens/dto/response/MoneyPersonality.java
 /Users/manaskapoor/Downloads/moneylens-backend/src/main/java/com/moneylens/util/MerchantResolver.java
 /Users/manaskapoor/Downloads/moneylens-backend/src/main/java/com/moneylens/service/AuthService.java
@@ -69,6 +71,7 @@
 /Users/manaskapoor/Downloads/moneylens-backend/src/main/java/com/moneylens/entity/Statement.java
 /Users/manaskapoor/Downloads/moneylens-backend/src/main/java/com/moneylens/controller/GoalPlanController.java
 /Users/manaskapoor/Downloads/moneylens-backend/src/main/java/com/moneylens/repository/StatementRepository.java
+/Users/manaskapoor/Downloads/moneylens-backend/src/main/java/com/moneylens/exception/DailyLimitExceededException.java
 /Users/manaskapoor/Downloads/moneylens-backend/src/main/java/com/moneylens/dto/response/TransactionDto.java
 /Users/manaskapoor/Downloads/moneylens-backend/src/main/java/com/moneylens/service/StatementParser.java
 /Users/manaskapoor/Downloads/moneylens-backend/src/main/java/com/moneylens/dto/response/HiddenPattern.java

@@ -30,6 +30,10 @@ public class ChatResponse {
     // ── Premium limit error (shown as a upsell card in the frontend) ─────────
     private String planLimitError;
 
+    // ── Token budget info ─────────────────────────────────────────────────────
+    private long tokensUsedToday;
+    private long tokensRemainingToday;
+
     // ─── Getters & Setters ────────────────────────────────────────────────────
 
     public UUID getChatId()                          { return chatId; }
@@ -58,11 +62,18 @@ public class ChatResponse {
 
     public boolean isDuplicateGoal()                 { return isDuplicateGoal; }
     public void setIsDuplicateGoal(boolean v)        { this.isDuplicateGoal = v; }
+
     public String getDuplicateGoalName()             { return duplicateGoalName; }
     public void setDuplicateGoalName(String name)    { this.duplicateGoalName = name; }
 
     public String getPlanLimitError()                { return planLimitError; }
     public void setPlanLimitError(String msg)        { this.planLimitError = msg; }
+
+    public long getTokensUsedToday()                             { return tokensUsedToday; }
+    public void setTokensUsedToday(long tokensUsedToday)         { this.tokensUsedToday = tokensUsedToday; }
+
+    public long getTokensRemainingToday()                        { return tokensRemainingToday; }
+    public void setTokensRemainingToday(long tokensRemainingToday) { this.tokensRemainingToday = tokensRemainingToday; }
 
     // ─── Nested: message DTO ─────────────────────────────────────────────────
 
