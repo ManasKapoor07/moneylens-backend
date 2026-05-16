@@ -107,7 +107,7 @@ public class User {
     public Role getRole() { return role; }
     public boolean isActive() { return active; }
     public boolean isEmailVerified() { return emailVerified; }
-    public boolean isHasStatement() { return hasStatement; }
+    public boolean getHasStatement() { return hasStatement; }
     public String getEmailVerificationToken() { return emailVerificationToken; }
     public LocalDateTime getEmailVerificationTokenExpiry() { return emailVerificationTokenExpiry; }
     public String getPasswordResetToken() { return passwordResetToken; }

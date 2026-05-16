@@ -18,22 +18,20 @@ public class SbiStatementParser implements BankStatementParser {
 
     private static final Logger log = LoggerFactory.getLogger(SbiStatementParser.class);
 
-    // SBI lines always start with two dd/MM/yyyy dates
     private static final Pattern TWO_DATE_LINE = Pattern.compile(
-            "^(\\d{2}/\\d{2}/\\d{4})\\s+(\\d{2}/\\d{2}/\\d{4})\\s+(.+)$"
-    );
-    private static final Pattern AMOUNT_PAT = Pattern.compile("[\\d,]+\\.\\d{2}");
+            "^(\\d{2}/\\d{2}/\\d{4})\\s+(\\d{2}/\\d{2}/\\d{4})\\s+(.+)$");
+    private static final Pattern AMOUNT_PAT    = Pattern.compile("[\\d,]+\\.\\d{2}");
+    private static final Pattern OPENING_BAL   = Pattern.compile(
+            "Opening\\s+Balance[:\\s]+([\\d,]+\\.\\d{2})", Pattern.CASE_INSENSITIVE);
+    private static final Pattern CLOSING_BAL   = Pattern.compile(
+            "Closing\\s+Balance[:\\s]+([\\d,]+\\.\\d{2})", Pattern.CASE_INSENSITIVE);
 
-    // SBI uses /DR/ and /CR/ in UPI refs — most reliable signal
-    // Balance delta is primary; these are used as secondary confirmation
     private static final List<String> CREDIT_SIGNALS = List.of(
             "/cr/", "salary", " sal", "neft cr", "credit", "refund",
             "cashback", "deposit", "reversal", "interest", "dividend",
             "stipend", "payroll", "dep tfr", "inward", "received"
     );
-    private static final List<String> DEBIT_SIGNALS = List.of(
-            "/dr/", "wdl tfr"
-    );
+    private static final List<String> DEBIT_SIGNALS = List.of("/dr/", "wdl tfr");
 
     @Override
     public boolean supports(String bankName) { return "SBI".equals(bankName); }
@@ -44,10 +42,6 @@ public class SbiStatementParser implements BankStatementParser {
         return parseCsv(filePath);
     }
 
-    // ─────────────────────────────────────────────────────────────────
-    // PDF PARSER
-    // ─────────────────────────────────────────────────────────────────
-
     private List<Map<String, String>> parsePdf(Path filePath) throws Exception {
         String text;
         try (PDDocument doc = Loader.loadPDF(filePath.toFile())) {
@@ -56,17 +50,19 @@ public class SbiStatementParser implements BankStatementParser {
             text = stripper.getText(doc);
         }
 
+        BigDecimal openingBalance = extractBalance(text, OPENING_BAL);
+        BigDecimal closingBalance = extractBalance(text, CLOSING_BAL);
+        log.info("SBI opening={} closing={}", openingBalance, closingBalance);
+
         List<String> lines = Arrays.stream(text.split("\n"))
                 .map(String::trim).filter(l -> !l.isBlank()).toList();
 
-        // Find data start
         int dataStart = -1;
         for (int i = 0; i < lines.size(); i++) {
             if (TWO_DATE_LINE.matcher(lines.get(i)).matches()) { dataStart = i; break; }
         }
         if (dataStart < 0) { log.warn("SBI: no transaction lines found"); return Collections.emptyList(); }
 
-        // Group into blocks
         List<List<String>> blocks = new ArrayList<>();
         List<String> currentBlock = null;
 
@@ -87,9 +83,8 @@ public class SbiStatementParser implements BankStatementParser {
 
         log.info("SBI found {} transaction blocks", blocks.size());
 
-        // Parse blocks with balance delta tracking
         List<Map<String, String>> rows = new ArrayList<>();
-        BigDecimal prevBalance = null;
+        BigDecimal prevBalance = openingBalance;
 
         for (List<String> block : blocks) {
             Map<String, String> row = parseBlock(block, prevBalance);
@@ -101,16 +96,15 @@ public class SbiStatementParser implements BankStatementParser {
 
         if (rows.isEmpty()) {
             log.warn("SBI block parser got 0 rows, trying flat line fallback");
-            rows = parseFlatLines(lines, dataStart);
+            rows = parseFlatLines(lines, dataStart, openingBalance);
         }
+
+        injectBalanceMetadata(rows, openingBalance,
+                closingBalance != null ? closingBalance : prevBalance);
 
         log.info("SBI PDF parsed {} rows", rows.size());
         return rows;
     }
-
-    // ─────────────────────────────────────────────────────────────────
-    // BLOCK PARSER
-    // ─────────────────────────────────────────────────────────────────
 
     private Map<String, String> parseBlock(List<String> block, BigDecimal prevBalance) {
         if (block.isEmpty()) return null;
@@ -122,7 +116,6 @@ public class SbiStatementParser implements BankStatementParser {
         String date      = m.group(1);
         String remainder = m.group(3);
 
-        // Collect all amounts across the block
         List<String> amounts = new ArrayList<>();
         for (String line : block) {
             Matcher am = AMOUNT_PAT.matcher(line);
@@ -130,8 +123,8 @@ public class SbiStatementParser implements BankStatementParser {
         }
         if (amounts.isEmpty()) return null;
 
-        String desc      = buildDescription(remainder, block);
-        String fullText  = String.join(" ", block).toLowerCase();
+        String desc       = buildDescription(remainder, block);
+        String fullText   = String.join(" ", block).toLowerCase();
         String balanceStr = amounts.get(amounts.size() - 1);
 
         Map<String, String> row = new LinkedHashMap<>();
@@ -140,50 +133,29 @@ public class SbiStatementParser implements BankStatementParser {
         row.put("balance",     balanceStr);
 
         if (amounts.size() >= 2) {
-            String txnAmount = amounts.get(amounts.size() - 2);
+            String     txnAmount = amounts.get(amounts.size() - 2);
+            BigDecimal curBal    = parseBD(balanceStr);
 
-            // ── DEBIT/CREDIT RESOLUTION ───────────────────────────────
-            // Priority 1: balance delta (most reliable for ALL transaction types)
-            // Priority 2: /DR/ or /CR/ in UPI reference string
-            // Priority 3: keyword signals in description
             boolean resolvedAsCredit;
-            BigDecimal curBal = parseBD(balanceStr);
-
             if (prevBalance != null && curBal != null) {
                 resolvedAsCredit = curBal.compareTo(prevBalance) > 0;
-                log.debug("SBI balance delta: prev={} cur={} → {}",
-                        prevBalance, curBal, resolvedAsCredit ? "CREDIT" : "DEBIT");
             } else if (DEBIT_SIGNALS.stream().anyMatch(fullText::contains)) {
                 resolvedAsCredit = false;
             } else if (CREDIT_SIGNALS.stream().anyMatch(fullText::contains)) {
                 resolvedAsCredit = true;
             } else {
-                // Cannot determine — default debit (safer for sanity check warnings)
                 resolvedAsCredit = false;
                 log.warn("SBI: could not determine direction for: {}", desc);
             }
 
-            if (resolvedAsCredit) {
-                row.put("credit", txnAmount);
-                row.put("debit",  "");
-            } else {
-                row.put("debit",  txnAmount);
-                row.put("credit", "");
-            }
+            row.put(resolvedAsCredit ? "credit" : "debit",   txnAmount);
+            row.put(resolvedAsCredit ? "debit"  : "credit",  "");
         } else {
             row.put("credit", "");
             row.put("debit",  "");
         }
-
-        log.debug("SBI block → date={} debit={} credit={} bal={} desc={}",
-                row.get("date"), row.get("debit"), row.get("credit"),
-                row.get("balance"), row.get("description"));
         return row;
     }
-
-    // ─────────────────────────────────────────────────────────────────
-    // DESCRIPTION BUILDER
-    // ─────────────────────────────────────────────────────────────────
 
     private String buildDescription(String remainder, List<String> block) {
         String cleaned = remainder
@@ -208,13 +180,11 @@ public class SbiStatementParser implements BankStatementParser {
         return desc.length() > 490 ? desc.substring(0, 490) : desc;
     }
 
-    // ─────────────────────────────────────────────────────────────────
-    // FLAT LINE FALLBACK
-    // ─────────────────────────────────────────────────────────────────
-
-    private List<Map<String, String>> parseFlatLines(List<String> lines, int startFrom) {
+    private List<Map<String, String>> parseFlatLines(List<String> lines,
+                                                     int startFrom,
+                                                     BigDecimal openingBalance) {
         List<Map<String, String>> rows = new ArrayList<>();
-        BigDecimal prevBalance = null;
+        BigDecimal prevBalance = openingBalance;
 
         for (int i = startFrom; i < lines.size(); i++) {
             String line = lines.get(i);
@@ -233,7 +203,8 @@ public class SbiStatementParser implements BankStatementParser {
 
             String balanceStr = amounts.get(amounts.size() - 1);
             String desc = remainder
-                    .replaceAll("[\\d,]+\\.\\d{2}", "").replaceAll("\\s+-\\s+", " ")
+                    .replaceAll("[\\d,]+\\.\\d{2}", "")
+                    .replaceAll("\\s+-\\s+", " ")
                     .replaceAll("-$", "").trim();
 
             Map<String, String> row = new LinkedHashMap<>();
@@ -242,12 +213,11 @@ public class SbiStatementParser implements BankStatementParser {
             row.put("balance",     balanceStr);
 
             if (amounts.size() >= 2) {
-                String txnAmount  = amounts.get(amounts.size() - 2);
-                String lineLower  = line.toLowerCase();
+                String     txnAmount = amounts.get(amounts.size() - 2);
+                String     lineLower = line.toLowerCase();
+                BigDecimal curBal    = parseBD(balanceStr);
 
                 boolean resolvedAsCredit;
-                BigDecimal curBal = parseBD(balanceStr);
-
                 if (prevBalance != null && curBal != null) {
                     resolvedAsCredit = curBal.compareTo(prevBalance) > 0;
                 } else if (DEBIT_SIGNALS.stream().anyMatch(lineLower::contains)) {
@@ -256,24 +226,20 @@ public class SbiStatementParser implements BankStatementParser {
                     resolvedAsCredit = CREDIT_SIGNALS.stream().anyMatch(lineLower::contains);
                 }
 
-                row.put(resolvedAsCredit ? "credit" : "debit", txnAmount);
+                row.put(resolvedAsCredit ? "credit" : "debit",  txnAmount);
                 row.put(resolvedAsCredit ? "debit"  : "credit", "");
                 prevBalance = curBal;
             } else {
-                row.put("credit", ""); row.put("debit", "");
+                row.put("credit", "");
+                row.put("debit",  "");
                 prevBalance = parseBD(balanceStr);
             }
-
             rows.add(row);
         }
 
         log.info("SBI flat-line fallback parsed {} rows", rows.size());
         return rows;
     }
-
-    // ─────────────────────────────────────────────────────────────────
-    // CSV PARSER
-    // ─────────────────────────────────────────────────────────────────
 
     private List<Map<String, String>> parseCsv(Path filePath) throws Exception {
         List<Map<String, String>> rows = new ArrayList<>();
@@ -288,8 +254,8 @@ public class SbiStatementParser implements BankStatementParser {
                         || joined.contains("withdrawal")) { headerIdx = i; break; }
             }
 
-            String[] headers = all.get(headerIdx);
-            log.info("SBI CSV headers: {}", Arrays.toString(headers));
+            String[]   headers        = all.get(headerIdx);
+            BigDecimal closingBalance = null;
 
             for (int i = headerIdx + 1; i < all.size(); i++) {
                 String[] vals = all.get(i);
@@ -299,36 +265,72 @@ public class SbiStatementParser implements BankStatementParser {
                     String h = headers[j].trim().toLowerCase();
                     String v = vals[j].trim();
                     if ((h.contains("txn date") || h.contains("value date") || h.equals("date"))
-                            && !row.containsKey("date"))                           row.put("date", v);
+                            && !row.containsKey("date"))                            row.put("date",        v);
                     else if (h.contains("narration") || h.contains("description")
-                            || h.contains("details") || h.contains("particulars")) row.put("description", v);
-                    else if (h.contains("debit") || h.contains("withdrawal"))      row.put("debit",   clean(v));
-                    else if (h.contains("credit") || h.contains("deposit"))        row.put("credit",  clean(v));
-                    else if (h.contains("balance"))                                 row.put("balance", clean(v));
+                            || h.contains("details") || h.contains("particulars"))  row.put("description", v);
+                    else if (h.contains("debit") || h.contains("withdrawal"))       row.put("debit",       clean(v));
+                    else if (h.contains("credit") || h.contains("deposit"))         row.put("credit",      clean(v));
+                    else if (h.contains("balance"))                               { row.put("balance",      clean(v));
+                        closingBalance = parseBD(clean(v)); }
                 }
                 if (row.containsKey("date") && !row.get("date").isBlank()) rows.add(row);
             }
+
+            BigDecimal openingBalance = inferOpeningBalance(rows);
+            injectBalanceMetadata(rows, openingBalance, closingBalance);
         }
         log.info("SBI CSV parsed {} rows", rows.size());
         return rows;
     }
 
-    // ─────────────────────────────────────────────────────────────────
-    // HELPERS
-    // ─────────────────────────────────────────────────────────────────
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    private void injectBalanceMetadata(List<Map<String, String>> rows,
+                                       BigDecimal opening, BigDecimal closing) {
+        if (rows.isEmpty()) return;
+        Map<String, String> first = rows.get(0);
+        if (opening != null) first.put("__opening_balance__", opening.toPlainString());
+        if (closing != null) first.put("__closing_balance__", closing.toPlainString());
+    }
+
+    private BigDecimal inferOpeningBalance(List<Map<String, String>> rows) {
+        if (rows.isEmpty()) return null;
+        Map<String, String> first   = rows.get(0);
+        BigDecimal          balance = parseBD(first.get("balance"));
+        if (balance == null) return null;
+
+        String debitStr  = first.get("debit");
+        String creditStr = first.get("credit");
+
+        if (debitStr != null && !debitStr.isBlank()) {
+            BigDecimal amt = parseBD(debitStr);
+            return amt != null ? balance.add(amt) : null;
+        }
+        if (creditStr != null && !creditStr.isBlank()) {
+            BigDecimal amt = parseBD(creditStr);
+            return amt != null ? balance.subtract(amt) : null;
+        }
+        return null;
+    }
+
+    private BigDecimal extractBalance(String text, Pattern pattern) {
+        Matcher m = pattern.matcher(text);
+        if (m.find()) return parseBD(m.group(1));
+        return null;
+    }
 
     private boolean isFooter(String line) {
         String lower = line.toLowerCase();
-        return lower.contains("statement summary") || lower.contains("please do not share")
-                || lower.contains("computer generated") || lower.contains("power of attorney")
-                || lower.startsWith("brought forward") || lower.startsWith("closing balance");
+        return lower.contains("statement summary")    || lower.contains("please do not share")
+                || lower.contains("computer generated")   || lower.contains("power of attorney")
+                || lower.startsWith("brought forward")    || lower.startsWith("closing balance");
     }
 
     private boolean isNoise(String line) {
         String lower = line.toLowerCase();
-        return lower.equals("balance") || lower.equals("wdl tfr") || lower.equals("dep tfr")
-                || lower.startsWith("page no.") || lower.startsWith("total debit")
-                || lower.startsWith("total credit");
+        return lower.equals("balance")            || lower.equals("wdl tfr")
+                || lower.equals("dep tfr")            || lower.startsWith("page no.")
+                || lower.startsWith("total debit")    || lower.startsWith("total credit");
     }
 
     private BigDecimal parseBD(String raw) {

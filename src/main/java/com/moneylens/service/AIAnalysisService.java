@@ -33,7 +33,6 @@ public class AIAnalysisService {
         this.statementRepository = statementRepository;
     }
 
-    @Async
     public void analyse(UUID statementId, List<Transaction> transactions) {
 
         log.info("Starting AI analysis for statement: {} ({} transactions)",

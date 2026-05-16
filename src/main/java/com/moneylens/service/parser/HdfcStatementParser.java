@@ -19,13 +19,6 @@ public class HdfcStatementParser implements BankStatementParser {
     private static final Logger log = LoggerFactory.getLogger(HdfcStatementParser.class);
 
     // HDFC PDF: Date  Narration  [Ref#]  ValueDate  [Withdrawal]  [Deposit]  Balance
-    // Group 1 = date
-    // Group 2 = narration
-    // Group 3 = ref (optional)
-    // Group 4 = value date
-    // Group 5 = withdrawal / DEBIT (optional)
-    // Group 6 = deposit   / CREDIT (optional)
-    // Group 7 = balance
     private static final Pattern HDFC_PDF = Pattern.compile(
             "^(\\d{2}/\\d{2}/\\d{2,4})" +
                     "\\s+(.+?)" +
@@ -36,8 +29,12 @@ public class HdfcStatementParser implements BankStatementParser {
                     "\\s+([\\d,]+\\.\\d{2})$"
     );
 
-    // Keywords that strongly indicate a CREDIT transaction.
-    // Used as a fallback when prevBalance is not yet available (first row).
+    private static final Pattern AMOUNT_PAT  = Pattern.compile("[\\d,]+\\.\\d{2}");
+    private static final Pattern OPENING_BAL = Pattern.compile(
+            "Opening\\s+Balance[:\\s]+([\\d,]+\\.\\d{2})", Pattern.CASE_INSENSITIVE);
+    private static final Pattern CLOSING_BAL = Pattern.compile(
+            "Closing\\s+Balance[:\\s]+([\\d,]+\\.\\d{2})", Pattern.CASE_INSENSITIVE);
+
     private static final List<String> CREDIT_SIGNALS = List.of(
             "salary", " sal", "neft cr", "/cr/", "credit", "refund",
             "cashback", "deposit", "reversal", "interest", "dividend",
@@ -45,9 +42,7 @@ public class HdfcStatementParser implements BankStatementParser {
     );
 
     @Override
-    public boolean supports(String bankName) {
-        return "HDFC".equals(bankName);
-    }
+    public boolean supports(String bankName) { return "HDFC".equals(bankName); }
 
     @Override
     public List<Map<String, String>> parse(Path filePath, String contentType) throws Exception {
@@ -63,59 +58,40 @@ public class HdfcStatementParser implements BankStatementParser {
             text = s.getText(doc);
         }
 
-        List<Map<String, String>> rows = new ArrayList<>();
-        List<String> failedLines = new ArrayList<>();
+        BigDecimal openingBalance = extractBalance(text, OPENING_BAL);
+        BigDecimal closingBalance = extractBalance(text, CLOSING_BAL);
+        log.info("HDFC opening={} closing={}", openingBalance, closingBalance);
 
-        BigDecimal prevBalance = null; // closing balance of the previous row
+        List<Map<String, String>> rows      = new ArrayList<>();
+        List<String>              failedLines = new ArrayList<>();
+        BigDecimal                prevBalance = openingBalance;
 
         for (String line : text.split("\n")) {
             line = line.trim();
             if (!line.matches("^\\d{2}/\\d{2}/\\d{2,4}.*")) continue;
 
             Matcher m = HDFC_PDF.matcher(line);
-            if (!m.matches()) {
-                failedLines.add(line);
-                continue;
-            }
+            if (!m.matches()) { failedLines.add(line); continue; }
 
-            String withdrawal = m.group(5); // DEBIT  (regex assignment)
-            String deposit    = m.group(6); // CREDIT (regex assignment)
+            String withdrawal = m.group(5);
+            String deposit    = m.group(6);
             String balanceStr = m.group(7);
             String descRaw    = m.group(2).trim();
 
-            // ── SINGLE-AMOUNT CORRECTION ──────────────────────────────────
-            // When only ONE amount appears before the balance, the regex always
-            // puts it in group 5 (withdrawal/debit) because group 6 is optional.
-            // This affects UPI credits, salary credits, and all inward transfers.
-            //
-            // Resolution priority:
-            //   1. BALANCE DELTA  — most reliable for ALL transaction types
-            //      balance went UP   → money came IN  → CREDIT
-            //      balance went DOWN → money went OUT → DEBIT
-            //
-            //   2. DESCRIPTION KEYWORDS — fallback only for the very first row
-            //      (when prevBalance is not yet known)
-            // ─────────────────────────────────────────────────────────────
+            // Single-amount correction via balance delta
             if (withdrawal != null && !withdrawal.isBlank()
                     && (deposit == null || deposit.isBlank())) {
 
                 boolean resolvedAsCredit = false;
 
                 if (prevBalance != null) {
-                    // Strategy 1: balance delta (handles UPI, NEFT, IMPS, salary — everything)
                     BigDecimal currentBalance = parseBD(balanceStr);
                     if (currentBalance != null) {
                         resolvedAsCredit = currentBalance.compareTo(prevBalance) > 0;
-                        log.debug("Balance delta: prev={} cur={} → {}",
-                                prevBalance, currentBalance,
-                                resolvedAsCredit ? "CREDIT" : "DEBIT");
                     }
                 } else {
-                    // Strategy 2: keyword fallback (first row only)
                     String descLower = descRaw.toLowerCase();
                     resolvedAsCredit = CREDIT_SIGNALS.stream().anyMatch(descLower::contains);
-                    if (resolvedAsCredit)
-                        log.debug("Credit keyword fallback (first row) for: {}", descRaw);
                 }
 
                 if (resolvedAsCredit) {
@@ -123,13 +99,10 @@ public class HdfcStatementParser implements BankStatementParser {
                     withdrawal = null;
                 }
             }
-            // ─────────────────────────────────────────────────────────────
 
-            // Update prevBalance for the next row
             BigDecimal currentBal = parseBD(balanceStr);
             if (currentBal != null) prevBalance = currentBal;
 
-            // Skip rows where both debit and credit are absent
             if ((withdrawal == null || withdrawal.isBlank()) &&
                     (deposit    == null || deposit.isBlank())) {
                 failedLines.add(line);
@@ -139,31 +112,25 @@ public class HdfcStatementParser implements BankStatementParser {
             Map<String, String> row = new LinkedHashMap<>();
             row.put("date",        m.group(1));
             row.put("description", descRaw);
-
-            if (withdrawal != null && !withdrawal.isBlank())
-                row.put("debit",  withdrawal.replace(",", ""));
-            if (deposit != null && !deposit.isBlank())
-                row.put("credit", deposit.replace(",", ""));
-            if (balanceStr != null && !balanceStr.isBlank())
-                row.put("balance", balanceStr.replace(",", ""));
-
+            if (withdrawal != null && !withdrawal.isBlank()) row.put("debit",  withdrawal.replace(",", ""));
+            if (deposit    != null && !deposit.isBlank())    row.put("credit", deposit.replace(",", ""));
+            if (balanceStr != null && !balanceStr.isBlank()) row.put("balance", balanceStr.replace(",", ""));
             rows.add(row);
-            log.debug("HDFC row: date={} debit={} credit={} bal={} desc={}",
-                    row.get("date"), row.get("debit"), row.get("credit"),
-                    row.get("balance"), row.get("description"));
         }
 
         if (rows.isEmpty() && !failedLines.isEmpty()) {
             log.warn("HDFC PDF regex failed on {} lines, trying heuristic", failedLines.size());
-            rows = parseHeuristic(failedLines);
+            rows = parseHeuristic(failedLines, openingBalance);
         }
 
-        log.info("HDFC PDF parsed {} rows ({} failed regex)", rows.size(), failedLines.size());
+        injectBalanceMetadata(rows, openingBalance,
+                closingBalance != null ? closingBalance : prevBalance);
+
+        log.info("HDFC PDF parsed {} rows", rows.size());
         return rows;
     }
 
     private List<Map<String, String>> parseCsv(Path filePath) throws Exception {
-        // HDFC CSV already has separate Debit Amount / Credit Amount columns — no correction needed.
         List<Map<String, String>> rows = new ArrayList<>();
         try (var reader = new com.opencsv.CSVReader(new FileReader(filePath.toFile()))) {
             List<String[]> all = reader.readAll();
@@ -172,13 +139,12 @@ public class HdfcStatementParser implements BankStatementParser {
             int headerIdx = 0;
             for (int i = 0; i < Math.min(all.size(), 15); i++) {
                 String joined = String.join(",", all.get(i)).toLowerCase();
-                if (joined.contains("narration") || joined.contains("date")) {
-                    headerIdx = i;
-                    break;
-                }
+                if (joined.contains("narration") || joined.contains("date")) { headerIdx = i; break; }
             }
 
-            String[] headers = all.get(headerIdx);
+            String[]   headers        = all.get(headerIdx);
+            BigDecimal closingBalance = null;
+
             for (int i = headerIdx + 1; i < all.size(); i++) {
                 String[] vals = all.get(i);
                 if (vals.length < 4) continue;
@@ -187,73 +153,62 @@ public class HdfcStatementParser implements BankStatementParser {
                 for (int j = 0; j < headers.length && j < vals.length; j++) {
                     String h = headers[j].trim().toLowerCase();
                     String v = vals[j].trim();
-                    if (h.contains("date") && !row.containsKey("date"))
-                        row.put("date", v);
-                    else if (h.contains("narration") || h.contains("description"))
-                        row.put("description", v);
-                    else if (h.contains("debit"))
-                        row.put("debit", clean(v));
-                    else if (h.contains("credit"))
-                        row.put("credit", clean(v));
-                    else if (h.contains("balance"))
-                        row.put("balance", clean(v));
+                    if (h.contains("date") && !row.containsKey("date"))              row.put("date",        v);
+                    else if (h.contains("narration") || h.contains("description"))   row.put("description", v);
+                    else if (h.contains("debit"))                                     row.put("debit",       clean(v));
+                    else if (h.contains("credit"))                                    row.put("credit",      clean(v));
+                    else if (h.contains("balance"))                                 { row.put("balance",     clean(v));
+                        closingBalance = parseBD(clean(v)); }
                 }
-                if (row.containsKey("date") && !row.get("date").isBlank())
-                    rows.add(row);
+                if (row.containsKey("date") && !row.get("date").isBlank()) rows.add(row);
             }
+
+            // CSV doesn't typically have an opening balance line; infer it
+            BigDecimal openingBalance = inferOpeningBalance(rows);
+            injectBalanceMetadata(rows, openingBalance, closingBalance);
         }
         log.info("HDFC CSV parsed {} rows", rows.size());
         return rows;
     }
 
-    private List<Map<String, String>> parseHeuristic(List<String> lines) {
+    private List<Map<String, String>> parseHeuristic(List<String> lines, BigDecimal openingBalance) {
         List<Map<String, String>> rows = new ArrayList<>();
         Pattern datePat = Pattern.compile("(\\d{2}/\\d{2}/\\d{2,4})");
-        Pattern amtPat  = Pattern.compile("[\\d,]+\\.\\d{2}");
 
-        BigDecimal prevBalance = null;
+        BigDecimal prevBalance = openingBalance;
 
         for (String line : lines) {
             Matcher dm = datePat.matcher(line);
             if (!dm.find()) continue;
 
             String date = dm.group();
-            Matcher amtM = amtPat.matcher(line);
+            Matcher amtM = AMOUNT_PAT.matcher(line);
             List<String> amounts = new ArrayList<>();
             String desc = line.replaceAll("\\d{2}/\\d{2}/\\d{2,4}", "")
-                    .replaceAll("[\\d,]+\\.\\d{2}", "")
-                    .trim();
+                    .replaceAll("[\\d,]+\\.\\d{2}", "").trim();
             while (amtM.find()) amounts.add(amtM.group().replace(",", ""));
             if (amounts.isEmpty()) continue;
 
             Map<String, String> row = new LinkedHashMap<>();
-            row.put("date", date);
+            row.put("date",        date);
             row.put("description", desc.isBlank() ? "HDFC Transaction" : desc);
 
             if (amounts.size() >= 2) {
-                String balStr = amounts.get(amounts.size() - 1);
-                String txnAmt = amounts.get(amounts.size() - 2);
+                String     balStr  = amounts.get(amounts.size() - 1);
+                String     txnAmt  = amounts.get(amounts.size() - 2);
+                BigDecimal curBal  = parseBD(balStr);
+
+                boolean resolvedAsCredit = (prevBalance != null && curBal != null)
+                        ? curBal.compareTo(prevBalance) > 0
+                        : CREDIT_SIGNALS.stream().anyMatch(line.toLowerCase()::contains);
+
                 row.put("balance", balStr);
-
-                boolean resolvedAsCredit = false;
-                BigDecimal currentBalance = parseBD(balStr);
-
-                if (prevBalance != null && currentBalance != null) {
-                    // Balance delta
-                    resolvedAsCredit = currentBalance.compareTo(prevBalance) > 0;
-                } else {
-                    // Keyword fallback for first row
-                    String lower = line.toLowerCase();
-                    resolvedAsCredit = CREDIT_SIGNALS.stream().anyMatch(lower::contains);
-                }
-
                 row.put(resolvedAsCredit ? "credit" : "debit", txnAmt);
-                prevBalance = currentBalance;
+                prevBalance = curBal;
             } else {
                 row.put("balance", amounts.get(0));
                 prevBalance = parseBD(amounts.get(0));
             }
-
             rows.add(row);
         }
         return rows;
@@ -261,13 +216,49 @@ public class HdfcStatementParser implements BankStatementParser {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
+    private void injectBalanceMetadata(List<Map<String, String>> rows,
+                                       BigDecimal opening, BigDecimal closing) {
+        if (rows.isEmpty()) return;
+        Map<String, String> first = rows.get(0);
+        if (opening != null) first.put("__opening_balance__", opening.toPlainString());
+        if (closing != null) first.put("__closing_balance__", closing.toPlainString());
+    }
+
+    /**
+     * Infers opening balance from the first transaction row:
+     * openingBalance = firstBalance +/- firstTxAmount
+     */
+    private BigDecimal inferOpeningBalance(List<Map<String, String>> rows) {
+        if (rows.isEmpty()) return null;
+        Map<String, String> first = rows.get(0);
+
+        BigDecimal balance = parseBD(first.get("balance"));
+        if (balance == null) return null;
+
+        String debitStr  = first.get("debit");
+        String creditStr = first.get("credit");
+
+        if (debitStr != null && !debitStr.isBlank()) {
+            BigDecimal amt = parseBD(debitStr);
+            return amt != null ? balance.add(amt) : null;       // opening = balance + debit
+        }
+        if (creditStr != null && !creditStr.isBlank()) {
+            BigDecimal amt = parseBD(creditStr);
+            return amt != null ? balance.subtract(amt) : null;  // opening = balance - credit
+        }
+        return null;
+    }
+
+    private BigDecimal extractBalance(String text, Pattern pattern) {
+        Matcher m = pattern.matcher(text);
+        if (m.find()) return parseBD(m.group(1));
+        return null;
+    }
+
     private BigDecimal parseBD(String raw) {
         if (raw == null || raw.isBlank()) return null;
-        try {
-            return new BigDecimal(raw.replace(",", "").trim());
-        } catch (NumberFormatException e) {
-            return null;
-        }
+        try { return new BigDecimal(raw.replace(",", "").trim()); }
+        catch (NumberFormatException e) { return null; }
     }
 
     private String clean(String v) {

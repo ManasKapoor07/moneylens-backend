@@ -11,13 +11,11 @@ import org.slf4j.LoggerFactory;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 
+import java.math.BigDecimal;
 import java.nio.file.Path;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
-import java.util.List;
-import java.util.Map;
-import java.util.Objects;
-import java.util.UUID;
+import java.util.*;
 
 @Service
 public class StatementParser {
@@ -35,11 +33,11 @@ public class StatementParser {
             DateTimeFormatter.ofPattern("d/M/yy")
     );
 
-    private final StatementRepository statementRepository;
-    private final TransactionExtractor transactionExtractor;
-    private final BankDetector bankDetector;
+    private final StatementRepository       statementRepository;
+    private final TransactionExtractor      transactionExtractor;
+    private final BankDetector              bankDetector;
     private final List<BankStatementParser> parsers;
-    private final GenericStatementParser genericParser;
+    private final GenericStatementParser    genericParser;
 
     public StatementParser(
             StatementRepository statementRepository,
@@ -55,8 +53,7 @@ public class StatementParser {
         this.genericParser        = genericParser;
     }
 
-    @Async
-    public void parse(UUID statementId, Path filePath, String contentType) {
+    public void parse(UUID statementId, Path filePath, String contentType, String bankName) {
         log.info("Parsing statement: {}", statementId);
 
         Statement statement = statementRepository.findById(statementId).orElse(null);
@@ -69,56 +66,51 @@ public class StatementParser {
             statement.setStatus(Statement.Status.PARSING);
             statementRepository.save(statement);
 
-            // Step 1 — detect bank from filename
-            String bankName = bankDetector.detectFromFileName(statement.getOriginalFileName());
-            log.info("Filename-based detection: {}", bankName);
+            // Step 1 — use user-supplied bankName; fall back to auto-detection only if absent
+            String resolvedBank = (bankName != null && !bankName.isBlank())
+                    ? bankName.toUpperCase()
+                    : bankDetector.detectFromFileName(statement.getOriginalFileName());
 
-            // Step 2 — if GENERIC and PDF, try content-based detection
-            if ("GENERIC".equals(bankName) && "application/pdf".equals(contentType)) {
-                bankName = bankDetector.detectFromContent(filePath);
-                log.info("Content-based detection: {}", bankName);
+            if ("GENERIC".equals(resolvedBank) && "application/pdf".equals(contentType)) {
+                resolvedBank = bankDetector.detectFromContent(filePath);
+                log.info("Content-based detection: {}", resolvedBank);
             }
 
-            log.info("Final bank: {} for statement: {}", bankName, statementId);
+            log.info("Final bank: {} for statement: {}", resolvedBank, statementId);
 
-            // Step 3 — pick the right parser
-            String finalBankName = bankName;
+            // Step 2 — pick parser
+            String finalResolvedBank = resolvedBank;
             BankStatementParser parser = parsers.stream()
-                    .filter(p -> p.supports(finalBankName))
+                    .filter(p -> p.supports(finalResolvedBank))
                     .findFirst()
                     .orElse(genericParser);
 
             log.info("Using parser: {}", parser.getClass().getSimpleName());
 
-            // Step 4 — parse rows
+            // Step 3 — parse rows
             List<Map<String, String>> rawRows = parser.parse(filePath, contentType);
             log.info("Parsed {} raw rows for statement: {}", rawRows.size(), statementId);
 
-            // Step 5 — populate statement metadata from parsed rows
-            enrichStatementMetadata(statement, rawRows, bankName);
+            // Step 4 — enrich statement metadata (dates, balances, account info)
+            enrichStatementMetadata(statement, rawRows, resolvedBank);
             statementRepository.save(statement);
-            log.info("Statement metadata enriched: bank={} account={} period={} to {}",
-                    statement.getBankName(), statement.getAccountNumber(),
-                    statement.getPeriodFrom(), statement.getPeriodTo());
+            log.info("Statement metadata enriched: bank={} account={} period={} to {} opening={} closing={}",
+                    statement.getBankName(), statement.getFileName(),
+                    statement.getPeriodFrom(), statement.getPeriodTo(),
+                    statement.getOpeningBalance(), statement.getClosingBalance());
 
-            // Step 6 — overlapping period duplicate check
-            // (file-hash check already happened in UploadService synchronously)
-            // This catches: same account, different file, overlapping date range.
-            if (statement.getAccountNumber() != null
+            // Step 5 — overlapping period duplicate check
+            if (statement.getFileName() != null
                     && statement.getPeriodFrom() != null
                     && statement.getPeriodTo() != null) {
 
                 User user = statement.getUser();
 
-                // We need to exclude the current statement from the check —
-                // do this by checking if any OTHER statement matches.
-                // Spring Data can't do "exclude self" cleanly, so we query
-                // and filter in memory (only runs once per upload, not a hot path).
                 boolean overlap = statementRepository
                         .findByUserOrderByCreatedAtDesc(user)
                         .stream()
-                        .filter(s -> !s.getId().equals(statementId))  // exclude self
-                        .filter(s -> statement.getAccountNumber().equals(s.getAccountNumber()))
+                        .filter(s -> !s.getId().equals(statementId))
+                        .filter(s -> statement.getFileName().equals(s.getFileName()))
                         .filter(s -> s.getPeriodFrom() != null && s.getPeriodTo() != null)
                         .anyMatch(s ->
                                 !s.getPeriodFrom().isAfter(statement.getPeriodTo()) &&
@@ -127,19 +119,15 @@ public class StatementParser {
 
                 if (overlap) {
                     log.warn("Duplicate period detected for statement: {} account: {} period: {} to {}",
-                            statementId, statement.getAccountNumber(),
+                            statementId, statement.getFileName(),
                             statement.getPeriodFrom(), statement.getPeriodTo());
                     statement.setStatus(Statement.Status.FAILED);
                     statementRepository.save(statement);
-                    // Note: the statement row stays in DB so the user sees
-                    // FAILED status with a meaningful message. The frontend
-                    // should show "Duplicate period" for FAILED statements
-                    // that have periodFrom/periodTo populated.
                     return;
                 }
             }
 
-            // Step 7 — extract transactions async
+            // Step 6 — extract transactions async
             transactionExtractor.extract(statementId, rawRows);
 
         } catch (Exception e) {
@@ -149,22 +137,39 @@ public class StatementParser {
         }
     }
 
-    // ─────────────────────────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────────────────
     // METADATA ENRICHMENT
-    // Derives bankName, periodFrom, periodTo from parsed rows.
-    // accountNumber and accountName require bank-specific extraction
-    // from PDF headers — parsers can expose these via a metadata map
-    // in a future iteration. For now we set what we can reliably get.
-    // ─────────────────────────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────────────────
 
     private void enrichStatementMetadata(Statement statement,
                                          List<Map<String, String>> rows,
-                                         String bankName) {
-        statement.setBankName(bankName);
+                                         String resolvedBank) {
+        statement.setBankName(resolvedBank);
 
         if (rows.isEmpty()) return;
 
-        // Derive date range from all transaction dates
+        extractAndRemoveMetaKey(rows, "__opening_balance__").ifPresent(v -> {
+            BigDecimal bd = parseBD(v);
+            if (bd != null) {
+                statement.setOpeningBalance(bd);
+                log.info("Statement opening balance set: {}", bd);
+            }
+        });
+
+        extractAndRemoveMetaKey(rows, "__closing_balance__").ifPresent(v -> {
+            BigDecimal bd = parseBD(v);
+            if (bd != null) {
+                statement.setClosingBalance(bd);
+                log.info("Statement closing balance set: {}", bd);
+            }
+        });
+
+        extractAndRemoveMetaKey(rows, "__account_number__")
+                .ifPresent(statement::setFileName);
+
+        extractAndRemoveMetaKey(rows, "__account_name__")
+                .ifPresent(statement::setAccountName);
+
         List<LocalDate> dates = rows.stream()
                 .map(r -> r.get("date"))
                 .filter(d -> d != null && !d.isBlank())
@@ -178,25 +183,32 @@ public class StatementParser {
             statement.setPeriodTo(dates.get(dates.size() - 1));
         }
 
-        // accountNumber: try to get from the rows if any parser puts it there
-        // (e.g. a parser could add a special "__account_number__" key to the first row)
-        rows.stream()
-                .map(r -> r.get("__account_number__"))
-                .filter(v -> v != null && !v.isBlank())
-                .findFirst()
-                .ifPresent(statement::setAccountNumber);
-
-        rows.stream()
-                .map(r -> r.get("__account_name__"))
-                .filter(v -> v != null && !v.isBlank())
-                .findFirst()
-                .ifPresent(statement::setAccountName);
-
-        // Fallback: if no account number from parser, use originalFileName
-        // so the unique constraint still works (two files = two accounts)
-        if (statement.getAccountNumber() == null) {
-            statement.setAccountNumber(statement.getOriginalFileName());
+        if (statement.getClosingBalance() == null) {
+            for (int i = rows.size() - 1; i >= 0; i--) {
+                String balStr = rows.get(i).get("balance");
+                if (balStr != null && !balStr.isBlank()) {
+                    BigDecimal bd = parseBD(balStr);
+                    if (bd != null) {
+                        statement.setClosingBalance(bd);
+                        log.info("Statement closing balance inferred from last transaction: {}", bd);
+                        break;
+                    }
+                }
+            }
         }
+
+        if (statement.getFileName() == null || statement.getFileName().isBlank()) {
+            statement.setFileName(statement.getOriginalFileName());
+        }
+    }
+
+    private Optional<String> extractAndRemoveMetaKey(List<Map<String, String>> rows, String key) {
+        Optional<String> value = rows.stream()
+                .map(r -> r.get(key))
+                .filter(v -> v != null && !v.isBlank())
+                .findFirst();
+        rows.forEach(r -> r.remove(key));
+        return value;
     }
 
     private LocalDate tryParseDate(String raw) {
@@ -207,5 +219,11 @@ public class StatementParser {
             catch (Exception ignored) {}
         }
         return null;
+    }
+
+    private BigDecimal parseBD(String raw) {
+        if (raw == null || raw.isBlank()) return null;
+        try { return new BigDecimal(raw.replace(",", "").trim()); }
+        catch (NumberFormatException e) { return null; }
     }
 }

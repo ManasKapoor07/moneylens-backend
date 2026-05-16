@@ -92,7 +92,6 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
                     log.debug("Authenticated user: {}", userEmail);
                 }
             }
-
         } catch (Exception e) {
 
             log.error(

@@ -71,6 +71,15 @@ public class GlobalExceptionHandler {
                 .body(ApiResponse.error("You don't have permission to access this resource"));
     }
 
+    @ExceptionHandler(PlanDurationExceededException.class)
+    public ResponseEntity<Map<String, Object>> handlePlanDurationExceeded(PlanDurationExceededException ex) {
+        return ResponseEntity.status(HttpStatus.PAYMENT_REQUIRED).body(Map.of(
+                "error",   "PREMIUM_REQUIRED",
+                "message", ex.getMessage(),
+                "premium", true
+        ));
+    }
+
     // FIX 1: Added missing handler — without this, wrong-method requests
     // fall through to the generic Exception handler and return 500
     @ExceptionHandler(HttpRequestMethodNotSupportedException.class)

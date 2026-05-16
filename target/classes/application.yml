@@ -54,9 +54,10 @@ logging:
     com.moneylens: DEBUG
     org.springframework.security: INFO
 
+
 openai:
-    api:
-      key: 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
+  api:
+    key: ${OPENAI_API_KEY}
 
 ---
 # Production profile

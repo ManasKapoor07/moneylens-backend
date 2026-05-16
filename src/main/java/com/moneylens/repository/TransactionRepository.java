@@ -2,6 +2,8 @@ package com.moneylens.repository;
 
 import com.moneylens.entity.Statement;
 import com.moneylens.entity.Transaction;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
@@ -13,16 +15,50 @@ import java.util.UUID;
 @Repository
 public interface TransactionRepository extends JpaRepository<Transaction, UUID> {
 
-    List<Transaction> findByStatementOrderByDateDesc(Statement statement);
-    
+    // ── Non-paginated (used by DashboardService for bulk aggregation) ──
 
-    List<Transaction> findByStatementAndType(Statement statement, Transaction.Type type);
+    List<Transaction> findByStatement(Statement statement);
 
-    List<Transaction> findByStatementAndCategory(Statement statement, String category);
+    // ── Paginated (used by StatementService.getTransactionsPaged) ──────
 
-    @Query("SELECT t FROM Transaction t WHERE t.statement.id = :statementId ORDER BY t.date DESC")
-    List<Transaction> findByStatementId(@Param("statementId") UUID statementId);
+    Page<Transaction> findByStatement(
+            Statement statement,
+            Pageable pageable);
 
-    @Query("SELECT t.category, SUM(t.amount) FROM Transaction t WHERE t.statement.id = :statementId AND t.type = 'DEBIT' GROUP BY t.category")
-    List<Object[]> sumByCategory(@Param("statementId") UUID statementId);
+    Page<Transaction> findByStatementAndType(
+            Statement statement,
+            Transaction.Type type,
+            Pageable pageable);
+
+    Page<Transaction> findByStatementAndCategory(
+            Statement statement,
+            String category,
+            Pageable pageable);
+
+    Page<Transaction> findByStatementAndTypeAndCategory(
+            Statement statement,
+            Transaction.Type type,
+            String category,
+            Pageable pageable);
+
+    // ── Aggregations (used by DashboardService) ──────────────────────
+
+    @Query("""
+           SELECT t.category, SUM(t.amount)
+           FROM Transaction t
+           WHERE t.statement.id = :statementId
+             AND t.type = 'DEBIT'
+           GROUP BY t.category
+           """)
+    List<Object[]> sumDebitByCategory(@Param("statementId") UUID statementId);
+
+
+    @Query("""
+       SELECT t
+       FROM Transaction t
+       WHERE t.statement.id = :statementId
+         AND t.type IN ('DEBIT', 'CREDIT')
+       ORDER BY t.date ASC
+       """)
+    List<Transaction> findAllByStatementIdOrdered(@Param("statementId") UUID statementId);
 }

@@ -33,6 +33,7 @@ public class UploadController {
     public ResponseEntity<ApiResponse<UploadResponse>> upload(
             @RequestParam("file") MultipartFile file,
             @RequestParam(value = "password", required = false) String password,
+            @RequestParam(value = "bankName", required = false) String bankName,
             Authentication authentication
     ) {
         String userEmail = authentication.getName();
@@ -49,10 +50,9 @@ public class UploadController {
                     .body(ApiResponse.error("Only PDF, CSV, or Excel files are accepted"));
 
         try {
-            UploadResponse response = uploadService.handleUpload(file, password, userEmail);
+            UploadResponse response = uploadService.handleUpload(file, password, userEmail, bankName);
             return ResponseEntity.ok(ApiResponse.success("Statement uploaded successfully", response));
         } catch (IllegalArgumentException e) {
-            // Wrong or missing PDF password — surface the message directly to the user
             return ResponseEntity.badRequest().body(ApiResponse.error(e.getMessage()));
         }
     }

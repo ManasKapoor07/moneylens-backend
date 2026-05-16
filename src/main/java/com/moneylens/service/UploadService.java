@@ -43,7 +43,7 @@ public class UploadService {
     }
 
     @Transactional
-    public UploadResponse handleUpload(MultipartFile file, String password, String userEmail) {
+    public UploadResponse handleUpload(MultipartFile file, String password, String userEmail, String bankName) {
 
         // 1. Fetch user
         User user = userRepository.findByEmail(userEmail)
@@ -86,15 +86,15 @@ public class UploadService {
         userRepository.save(user);
 
         // 7. Trigger parsing pipeline asynchronously
-        //    Parser will populate bankName, accountNumber, periodFrom, periodTo
-        //    and then check for overlapping period duplicates before proceeding.
-        statementParser.parse(statement.getId(), filePath, file.getContentType());
+        //    bankName passed directly from user selection; parser skips auto-detection.
+        statementParser.parse(statement.getId(), filePath, file.getContentType(), bankName);
 
         return UploadResponse.builder()
                 .statementId(statement.getId())
                 .fileName(file.getOriginalFilename())
                 .status("PROCESSING")
                 .hasStatement(true)
+                .detectedBank(bankName)
                 .build();
     }
 

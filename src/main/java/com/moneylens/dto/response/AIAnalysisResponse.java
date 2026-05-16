@@ -4,27 +4,78 @@ import java.util.List;
 
 public class AIAnalysisResponse {
 
+    // =============================================
+    // SUMMARY
+    // 2–3 sentences. Behavior-first. Feels personal.
+    // =============================================
+
     private String summary;
+
+    // =============================================
+    // MONEY PERSONALITY
+    // The "who you are with money" identity card.
+    // =============================================
+
+    private MoneyPersonality moneyPersonality;
+
+    // =============================================
+    // SPENDING PULSE
+    // One-liner vibe check on cash flow health.
+    // =============================================
+
+    private SpendingPulse spendingPulse;
+
+    // =============================================
+    // RISKS
+    // Real, behavior-backed, specific.
+    // =============================================
 
     private List<String> risks;
 
+    // =============================================
+    // POSITIVE HABITS
+    // Stabilizing behaviors — honest, not flattering.
+    // =============================================
+
     private List<String> positiveHabits;
+
+    // =============================================
+    // RECOMMENDATIONS
+    // High-leverage, behavior-specific improvements.
+    // =============================================
 
     private List<String> recommendations;
 
+    // =============================================
+    // NEXT ACTIONS
+    // Things they can do THIS week.
+    // =============================================
+
     private List<String> nextActions;
 
-    // NEW
-    private List<String> projections;
+    // =============================================
+    // PROJECTIONS
+    // Structured cards — headline + real-life impact.
+    // =============================================
 
-    // NEW
-    private List<String> behavioralSignals;
-
-    // NEW
-    private List<String> hiddenPatterns;
+    private List<ProjectionCard> projections;
 
     // =============================================
-    // SUMMARY
+    // BEHAVIORAL SIGNALS
+    // Named patterns with emotion + intensity.
+    // =============================================
+
+    private List<BehavioralSignal> behavioralSignals;
+
+    // =============================================
+    // HIDDEN PATTERNS
+    // Things they never noticed — the "woah" section.
+    // =============================================
+
+    private List<HiddenPattern> hiddenPatterns;
+
+    // =============================================
+    // GETTERS & SETTERS
     // =============================================
 
     public String getSummary() {
@@ -35,9 +86,25 @@ public class AIAnalysisResponse {
         this.summary = summary;
     }
 
-    // =============================================
-    // RISKS
-    // =============================================
+    public MoneyPersonality getMoneyPersonality() {
+        return moneyPersonality;
+    }
+
+    public void setMoneyPersonality(
+            MoneyPersonality moneyPersonality
+    ) {
+        this.moneyPersonality = moneyPersonality;
+    }
+
+    public SpendingPulse getSpendingPulse() {
+        return spendingPulse;
+    }
+
+    public void setSpendingPulse(
+            SpendingPulse spendingPulse
+    ) {
+        this.spendingPulse = spendingPulse;
+    }
 
     public List<String> getRisks() {
         return risks;
@@ -46,10 +113,6 @@ public class AIAnalysisResponse {
     public void setRisks(List<String> risks) {
         this.risks = risks;
     }
-
-    // =============================================
-    // POSITIVE HABITS
-    // =============================================
 
     public List<String> getPositiveHabits() {
         return positiveHabits;
@@ -61,10 +124,6 @@ public class AIAnalysisResponse {
         this.positiveHabits = positiveHabits;
     }
 
-    // =============================================
-    // RECOMMENDATIONS
-    // =============================================
-
     public List<String> getRecommendations() {
         return recommendations;
     }
@@ -74,10 +133,6 @@ public class AIAnalysisResponse {
     ) {
         this.recommendations = recommendations;
     }
-
-    // =============================================
-    // NEXT ACTIONS
-    // =============================================
 
     public List<String> getNextActions() {
         return nextActions;
@@ -89,44 +144,32 @@ public class AIAnalysisResponse {
         this.nextActions = nextActions;
     }
 
-    // =============================================
-    // PROJECTIONS
-    // =============================================
-
-    public List<String> getProjections() {
+    public List<ProjectionCard> getProjections() {
         return projections;
     }
 
     public void setProjections(
-            List<String> projections
+            List<ProjectionCard> projections
     ) {
         this.projections = projections;
     }
 
-    // =============================================
-    // BEHAVIORAL SIGNALS
-    // =============================================
-
-    public List<String> getBehavioralSignals() {
+    public List<BehavioralSignal> getBehavioralSignals() {
         return behavioralSignals;
     }
 
     public void setBehavioralSignals(
-            List<String> behavioralSignals
+            List<BehavioralSignal> behavioralSignals
     ) {
         this.behavioralSignals = behavioralSignals;
     }
 
-    // =============================================
-    // HIDDEN PATTERNS
-    // =============================================
-
-    public List<String> getHiddenPatterns() {
+    public List<HiddenPattern> getHiddenPatterns() {
         return hiddenPatterns;
     }
 
     public void setHiddenPatterns(
-            List<String> hiddenPatterns
+            List<HiddenPattern> hiddenPatterns
     ) {
         this.hiddenPatterns = hiddenPatterns;
     }

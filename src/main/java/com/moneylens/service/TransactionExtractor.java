@@ -28,7 +28,6 @@ public class TransactionExtractor {
         this.worker = worker;
     }
 
-    @Async
     public void extract(UUID statementId, List<Map<String, String>> rawRows) {
         log.info("Async extraction queued for statement: {}", statementId);
         worker.doExtract(statementId, rawRows);

@@ -19,7 +19,7 @@ public class GenericStatementParser implements BankStatementParser {
 
     private static final Pattern DATE_PAT = Pattern.compile(
             "\\b(\\d{1,2}[/-]\\d{1,2}[/-]\\d{2,4}|\\d{1,2}\\s+\\w{3}\\s+\\d{4})\\b");
-    private static final Pattern AMT_PAT = Pattern.compile("[\\d,]+\\.\\d{2}");
+    private static final Pattern AMT_PAT  = Pattern.compile("[\\d,]+\\.\\d{2}");
 
     private static final List<String> CREDIT_SIGNALS = List.of(
             "salary", " sal", "neft cr", "/cr/", "credit", "refund",
@@ -44,8 +44,23 @@ public class GenericStatementParser implements BankStatementParser {
             text = s.getText(doc);
         }
 
-        return parseHeuristic(Arrays.stream(text.split("\n"))
-                .map(String::trim).filter(l -> !l.isBlank()).toList());
+        List<String> lines = Arrays.stream(text.split("\n"))
+                .map(String::trim).filter(l -> !l.isBlank()).toList();
+
+        List<Map<String, String>> rows = parseHeuristic(lines);
+
+        // Inject balance metadata so StatementParser can persist it
+        if (!rows.isEmpty()) {
+            BigDecimal closing = null;
+            for (int i = rows.size() - 1; i >= 0; i--) {
+                closing = parseBD(rows.get(i).get("balance"));
+                if (closing != null) break;
+            }
+            BigDecimal opening = inferOpeningBalance(rows);
+            injectBalanceMetadata(rows, opening, closing);
+        }
+
+        return rows;
     }
 
     private List<Map<String, String>> parseHeuristic(List<String> lines) {
@@ -60,8 +75,8 @@ public class GenericStatementParser implements BankStatementParser {
             String rest = line.substring(dm.end()).trim();
 
             Matcher amtM = AMT_PAT.matcher(rest);
-            List<String> amounts = new ArrayList<>();
-            String description   = rest;
+            List<String> amounts    = new ArrayList<>();
+            String       description = rest;
 
             while (amtM.find()) {
                 if (amounts.isEmpty()) description = rest.substring(0, amtM.start()).trim();
@@ -75,32 +90,24 @@ public class GenericStatementParser implements BankStatementParser {
             row.put("description", description.isBlank() ? "Unknown" : description);
 
             if (amounts.size() >= 2) {
-                String balStr  = amounts.get(amounts.size() - 1);
-                String txnAmt  = amounts.get(amounts.size() - 2);
-                row.put("balance", balStr);
-
-                // ── DEBIT/CREDIT RESOLUTION ───────────────────────────────
-                // Priority 1: balance delta
-                // Priority 2: keyword signals in line
-                // Priority 3: default to credit (generic — we don't know the format)
-                boolean resolvedAsCredit;
+                String     balStr = amounts.get(amounts.size() - 1);
+                String     txnAmt = amounts.get(amounts.size() - 2);
                 BigDecimal curBal = parseBD(balStr);
 
+                boolean resolvedAsCredit;
                 if (prevBalance != null && curBal != null) {
                     resolvedAsCredit = curBal.compareTo(prevBalance) > 0;
-                    log.debug("GENERIC balance delta: prev={} cur={} → {}",
-                            prevBalance, curBal, resolvedAsCredit ? "CREDIT" : "DEBIT");
                 } else {
                     String lower = line.toLowerCase();
-                    if (DEBIT_SIGNALS.stream().anyMatch(lower::contains))        resolvedAsCredit = false;
-                    else if (CREDIT_SIGNALS.stream().anyMatch(lower::contains))  resolvedAsCredit = true;
-                    else                                                          resolvedAsCredit = true; // safe default
+                    if      (DEBIT_SIGNALS.stream().anyMatch(lower::contains))  resolvedAsCredit = false;
+                    else if (CREDIT_SIGNALS.stream().anyMatch(lower::contains)) resolvedAsCredit = true;
+                    else                                                         resolvedAsCredit = true;
                 }
 
+                row.put("balance", balStr);
                 row.put(resolvedAsCredit ? "credit" : "debit", txnAmt);
                 prevBalance = curBal;
             } else {
-                // Only one amount — treat as balance, no transaction amount extractable
                 row.put("balance", amounts.get(0));
                 prevBalance = parseBD(amounts.get(0));
             }
@@ -110,6 +117,34 @@ public class GenericStatementParser implements BankStatementParser {
 
         log.info("Generic heuristic parsed {} rows", rows.size());
         return rows;
+    }
+
+    private void injectBalanceMetadata(List<Map<String, String>> rows,
+                                       BigDecimal opening, BigDecimal closing) {
+        if (rows.isEmpty()) return;
+        Map<String, String> first = rows.get(0);
+        if (opening != null) first.put("__opening_balance__", opening.toPlainString());
+        if (closing != null) first.put("__closing_balance__", closing.toPlainString());
+    }
+
+    private BigDecimal inferOpeningBalance(List<Map<String, String>> rows) {
+        if (rows.isEmpty()) return null;
+        Map<String, String> first   = rows.get(0);
+        BigDecimal          balance = parseBD(first.get("balance"));
+        if (balance == null) return null;
+
+        String debitStr  = first.get("debit");
+        String creditStr = first.get("credit");
+
+        if (debitStr != null && !debitStr.isBlank()) {
+            BigDecimal amt = parseBD(debitStr);
+            return amt != null ? balance.add(amt) : null;
+        }
+        if (creditStr != null && !creditStr.isBlank()) {
+            BigDecimal amt = parseBD(creditStr);
+            return amt != null ? balance.subtract(amt) : null;
+        }
+        return null;
     }
 
     private BigDecimal parseBD(String raw) {

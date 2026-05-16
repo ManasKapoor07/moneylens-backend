@@ -145,7 +145,7 @@ public class AuthController {
                 .email(user.getEmail())
                 .role(user.getRole().name())
                 .emailVerified(user.isEmailVerified())
-                .hasStatement(user.isHasStatement())
+                .hasStatement(user.getHasStatement())
                 .build();
 
         return ResponseEntity.ok(ApiResponse.success("User profile fetched", userInfo));
