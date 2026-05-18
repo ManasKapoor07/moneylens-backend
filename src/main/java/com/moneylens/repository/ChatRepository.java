@@ -11,4 +11,6 @@ public interface ChatRepository extends JpaRepository<Chat, UUID> {
     List<Chat> findByUserIdAndStatementIdOrderByUpdatedAtDesc(UUID userId, UUID statementId);
 
     List<Chat> findByUserIdOrderByUpdatedAtDesc(UUID userId);
+
+
 }

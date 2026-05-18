@@ -1,16 +1,15 @@
 package com.moneylens.service;
 
+import com.moneylens.entity.BehavioralSignal;
 import com.moneylens.entity.Statement;
 import com.moneylens.entity.Transaction;
 import com.moneylens.entity.TransactionInsight;
-
 import com.moneylens.repository.StatementRepository;
 import com.moneylens.repository.TransactionInsightRepository;
 import com.moneylens.repository.TransactionRepository;
-
+import com.moneylens.signal.engine.BehavioralSignalEngine;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -19,282 +18,142 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
+/**
+ * CHANGES FROM ORIGINAL:
+ *   - Injects BehavioralSignalEngine
+ *   - Step 2.5 added between insights and AI context:
+ *       computeForStatement() → List<BehavioralSignal>
+ *   - buildContext() now receives signals
+ *
+ * Pipeline order:
+ *   1. Transaction extraction
+ *   2. Insights (TransactionInsight)
+ *   2.5 Behavioral signals (BehavioralSignal) ← NEW
+ *   3. AI context (includes signals)
+ *   4. Persist financial profile
+ *   5. Mark COMPLETED
+ *   6. Trigger user profile rebuild
+ */
 @Service
 public class TransactionExtractionWorker {
 
-    private static final Logger log =
-            LoggerFactory.getLogger(
-                    TransactionExtractionWorker.class
-            );
+    private static final Logger log = LoggerFactory.getLogger(TransactionExtractionWorker.class);
 
-    private final StatementRepository statementRepository;
-
-    private final TransactionRepository transactionRepository;
-
-    private final TransactionInsightRepository insightRepository;
-
-    private final TransactionMapper mapper;
-
-    private final AIContextBuilderService aiContextBuilder;
-
-    private final FinancialProfilePersistenceService
-            financialProfilePersistenceService;
+    private final StatementRepository              statementRepository;
+    private final TransactionRepository            transactionRepository;
+    private final TransactionInsightRepository     insightRepository;
+    private final TransactionMapper                mapper;
+    private final AIContextBuilderService          aiContextBuilder;
+    private final BehavioralSignalEngine           signalEngine;          // NEW
+    private final FinancialProfilePersistenceService financialProfilePersistenceService;
+    private final UserProfileAggregatorService     userProfileAggregatorService;
 
     public TransactionExtractionWorker(
-
             StatementRepository statementRepository,
-
             TransactionRepository transactionRepository,
-
             TransactionInsightRepository insightRepository,
-
             TransactionMapper mapper,
-
             AIContextBuilderService aiContextBuilder,
-
-            FinancialProfilePersistenceService
-                    financialProfilePersistenceService
-
+            BehavioralSignalEngine signalEngine,
+            FinancialProfilePersistenceService financialProfilePersistenceService,
+            UserProfileAggregatorService userProfileAggregatorService
     ) {
-
-        this.statementRepository =
-                statementRepository;
-
-        this.transactionRepository =
-                transactionRepository;
-
-        this.insightRepository =
-                insightRepository;
-
-        this.mapper =
-                mapper;
-
-        this.aiContextBuilder =
-                aiContextBuilder;
-
-        this.financialProfilePersistenceService =
-                financialProfilePersistenceService;
+        this.statementRepository             = statementRepository;
+        this.transactionRepository           = transactionRepository;
+        this.insightRepository               = insightRepository;
+        this.mapper                          = mapper;
+        this.aiContextBuilder                = aiContextBuilder;
+        this.signalEngine                    = signalEngine;
+        this.financialProfilePersistenceService = financialProfilePersistenceService;
+        this.userProfileAggregatorService    = userProfileAggregatorService;
     }
 
     @Transactional
-    public void doExtract(
-            UUID statementId,
-            List<Map<String, String>> rawRows
-    ) {
+    public void doExtract(UUID statementId, List<Map<String, String>> rawRows) {
 
-        log.info(
-                "Extracting transactions for statement: {} ({} raw rows)",
-                statementId,
-                rawRows.size()
-        );
+        log.info("Extracting transactions for statement: {} ({} raw rows)",
+                statementId, rawRows.size());
 
-        Statement statement =
-                statementRepository
-                        .findById(statementId)
-                        .orElse(null);
-
+        Statement statement = statementRepository.findById(statementId).orElse(null);
         if (statement == null) {
-
-            log.warn(
-                    "Statement not found: {}",
-                    statementId
-            );
-
+            log.warn("Statement not found: {}", statementId);
             return;
         }
 
         try {
-
-            // =====================================================
-            // STEP 1 — TRANSACTION EXTRACTION
-            // =====================================================
-
-            statement.setStatus(
-                    Statement.Status.EXTRACTING
-            );
-
+            // ── STEP 1: Transaction extraction ────────────────────────────────
+            statement.setStatus(Statement.Status.EXTRACTING);
             statementRepository.save(statement);
 
-            List<Transaction> transactions =
-                    new ArrayList<>();
-
+            List<Transaction> transactions = new ArrayList<>();
             int skipped = 0;
 
             for (Map<String, String> row : rawRows) {
-
                 try {
-
-                    Transaction tx =
-                            mapper.mapRowToTransaction(
-                                    row,
-                                    statement
-                            );
-
-                    if (tx != null) {
-
-                        transactions.add(tx);
-
-                    } else {
-
-                        skipped++;
-
-                        log.debug(
-                                "Row skipped (null): {}",
-                                row
-                        );
-                    }
-
+                    Transaction tx = mapper.mapRowToTransaction(row, statement);
+                    if (tx != null) transactions.add(tx);
+                    else skipped++;
                 } catch (Exception e) {
-
                     skipped++;
-
-                    log.warn(
-                            "Malformed row skipped: {} — {}",
-                            row,
-                            e.getMessage()
-                    );
+                    log.warn("Malformed row skipped: {} — {}", row, e.getMessage());
                 }
             }
 
-            // =====================================================
-            // SANITY AUDIT
-            // =====================================================
+            long debitCount  = transactions.stream().filter(t -> t.getType() == Transaction.Type.DEBIT).count();
+            long creditCount = transactions.stream().filter(t -> t.getType() == Transaction.Type.CREDIT).count();
 
-            long debitCount =
-                    transactions.stream()
-                            .filter(t ->
-                                    t.getType()
-                                            == Transaction.Type.DEBIT
-                            )
-                            .count();
+            log.info("Statement {}: {} mapped | {} debit | {} credit | {} skipped",
+                    statementId, transactions.size(), debitCount, creditCount, skipped);
 
-            long creditCount =
-                    transactions.stream()
-                            .filter(t ->
-                                    t.getType()
-                                            == Transaction.Type.CREDIT
-                            )
-                            .count();
+            if (transactions.size() > 5 && creditCount == 0)
+                log.error("SANITY FAIL: 0 credits — possible parser bug for statement: {}", statementId);
+            if (transactions.size() > 5 && debitCount == 0)
+                log.error("SANITY FAIL: 0 debits — possible parser bug for statement: {}", statementId);
 
-            log.info(
-                    "Statement {}: {} mapped | {} debit | {} credit | {} skipped",
+            transactionRepository.saveAll(transactions);
+
+            // ── STEP 2: Insights ──────────────────────────────────────────────
+            statement.setStatus(Statement.Status.ANALYSING);
+            statementRepository.save(statement);
+
+            List<TransactionInsight> insights = mapper.deriveInsights(statement, transactions);
+            insightRepository.saveAll(insights);
+            log.info("Saved {} insights for statement: {}", insights.size(), statementId);
+
+            // ── STEP 2.5: Behavioral signals ──────────────────────────────────
+            UUID userId = statement.getUser().getId();
+            List<BehavioralSignal> signals = signalEngine.computeForStatement(
+                    statementId, userId, transactions
+            );
+            log.info("Computed {} signals for statement: {} ({} fired)",
+                    signals.size(),
                     statementId,
-                    transactions.size(),
-                    debitCount,
-                    creditCount,
-                    skipped
+                    signals.stream().filter(BehavioralSignal::isFired).count());
+
+            // ── STEP 3: AI context (with signals) ─────────────────────────────
+            AIContextBuilderService.AIContext context = aiContextBuilder.buildContext(
+                    transactions, insights, signals
             );
 
-            if (
-                    transactions.size() > 5
-                            && creditCount == 0
-            ) {
+            // ── STEP 4: Persist financial profile ─────────────────────────────
+            financialProfilePersistenceService.saveProfile(statement, context);
+            log.info("Financial profile persisted for statement: {}", statementId);
 
-                log.error(
-                        "SANITY FAIL: 0 credits detected — possible parser bug for statement: {}",
-                        statementId
-                );
-            }
-
-            if (
-                    transactions.size() > 5
-                            && debitCount == 0
-            ) {
-
-                log.error(
-                        "SANITY FAIL: 0 debits detected — possible parser bug for statement: {}",
-                        statementId
-                );
-            }
-
-            transactionRepository.saveAll(
-                    transactions
-            );
-
-            log.info(
-                    "Saved {} transactions for statement: {}",
-                    transactions.size(),
-                    statementId
-            );
-
-            // =====================================================
-            // STEP 2 — INSIGHTS
-            // =====================================================
-
-            statement.setStatus(
-                    Statement.Status.ANALYSING
-            );
-
+            // ── STEP 5: Complete ──────────────────────────────────────────────
+            statement.setStatus(Statement.Status.COMPLETED);
             statementRepository.save(statement);
 
-            List<TransactionInsight> insights =
-                    mapper.deriveInsights(
-                            statement,
-                            transactions
-                    );
-
-            insightRepository.saveAll(
-                    insights
-            );
-
-            log.info(
-                    "Saved {} insights for statement: {}",
-                    insights.size(),
-                    statementId
-            );
-
-            // =====================================================
-            // STEP 3 — AI CONTEXT
-            // =====================================================
-
-            AIContextBuilderService.AIContext context =
-                    aiContextBuilder.buildContext(
-                            transactions,
-                            insights
-                    );
-
-            log.info(
-                    "AI context built for statement: {}",
-                    statementId
-            );
-
-            // =====================================================
-            // STEP 4 — PERSIST FINANCIAL PROFILE
-            // =====================================================
-
-            financialProfilePersistenceService
-                    .saveProfile(
-                            statement,
-                            context
-                    );
-
-            log.info(
-                    "Financial profile persisted for statement: {}",
-                    statementId
-            );
-
-            // =====================================================
-            // STEP 5 — COMPLETE
-            // =====================================================
-
-            statement.setStatus(
-                    Statement.Status.COMPLETED
-            );
-
-            statementRepository.save(statement);
+            // ── STEP 6: Rebuild user profile ──────────────────────────────────
+            try {
+                userProfileAggregatorService.recompute(userId, UserProfileAggregatorService.REASON_NEW_STATEMENT);
+                log.info("User profile rebuilt for user: {}", userId);
+            } catch (Exception e) {
+                log.warn("Profile rebuild failed after upload — will retry on next startup", e);
+            }
 
         } catch (Exception e) {
-
-            log.error(
-                    "Extraction failed for statement: {}",
-                    statementId,
-                    e
-            );
-
-            statement.setStatus(
-                    Statement.Status.FAILED
-            );
-
+            log.error("Extraction failed for statement: {}", statementId, e);
+            statement.setStatus(Statement.Status.FAILED);
             statementRepository.save(statement);
         }
     }

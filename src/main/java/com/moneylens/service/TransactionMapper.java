@@ -6,6 +6,7 @@ import com.moneylens.entity.TransactionInsight;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
+
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.DayOfWeek;
@@ -16,22 +17,27 @@ import java.util.*;
 import java.util.stream.Collectors;
 
 /**
- * TransactionMapper — maps raw row maps to Transaction entities and derives
- * rich behavioral insights.
+ * TransactionMapper
  *
- * KEY FIX: The previous categoriser checked only short keyword snippets and
- * therefore classified almost everything as "Other".  The new version:
- *   1. Normalises the FULL description to lowercase once.
- *   2. Applies a priority-ordered keyword table that covers every merchant
- *      family seen in Axis Bank UPI descriptions (which embed the merchant
- *      name inside the UPI reference string).
- *   3. Falls back to a P2P heuristic only for UPI transfers to individuals
- *      that did NOT match any merchant keyword.
+ * CHANGED FROM ORIGINAL:
+ *   - Removed KEYWORD_RULES static list (now lives in MerchantRegistry / DB)
+ *   - Removed KNOWN_SERVICES set (MerchantRegistry handles P2P detection)
+ *   - Removed categorise() / normalizeMerchant() / inferEmployer() methods
+ *   - All categorization now delegated to MerchantRegistry.resolve()
+ *   - Transaction now stores confidence + categorySource from CategoryResult
+ *
+ * STILL OWNED HERE (parsing concerns only):
+ *   - Date / amount / column parsing
+ *   - Debit vs credit type resolution
+ *   - cleanMerchant() for display name (delegates to MerchantRegistry.normalize())
+ *   - deriveInsights() — behavioral insight building
  */
 @Component
 public class TransactionMapper {
 
     private static final Logger log = LoggerFactory.getLogger(TransactionMapper.class);
+
+    private final MerchantRegistry merchantRegistry;
 
     // ── Date formats tried in order ───────────────────────────────────────────
     private static final List<DateTimeFormatter> DATE_FORMATS = List.of(
@@ -45,334 +51,9 @@ public class TransactionMapper {
             DateTimeFormatter.ofPattern("d/M/yy")
     );
 
-    // ═════════════════════════════════════════════════════════════════════════
-    // CATEGORY KEYWORD TABLE
-    //
-    // Rules:
-    //  • Order matters — first match wins.
-    //  • Each entry is { keyword_substring (lowercase), category }.
-    //  • Keywords are matched against the FULL lowercased description so they
-    //    work even when embedded inside a UPI reference like:
-    //    "UPI/P2M/609787981155/ZOMATO LIMITED /Zomato/YES BANK LIMITED YBS"
-    // ═════════════════════════════════════════════════════════════════════════
-
-    /**
-     * Ordered list of [keyword, category] pairs.
-     * Uses a list (not a map) to preserve insertion order and allow
-     * multiple keywords mapping to the same category.
-     */
-    private static final List<String[]> KEYWORD_RULES = new ArrayList<>();
-
-    static {
-        // ── 1. EMI / Loan (check early — very unambiguous) ───────────────────
-        addRule("bajaj fin",        "EMI / Loan");
-        addRule("hdfc loan",        "EMI / Loan");
-        addRule("icici loan",       "EMI / Loan");
-        addRule("loan repay",       "EMI / Loan");
-        addRule("equitas",          "EMI / Loan");
-        addRule("nach debit",       "EMI / Loan");
-        addRule("ecs debit",        "EMI / Loan");
-        addRule("mandate debit",    "EMI / Loan");
-        // Generic " emi" / "emi " — keep AFTER merchant-specific ones
-        addRule(" emi ",            "EMI / Loan");
-
-        // ── 2. Food & Dining ─────────────────────────────────────────────────
-        addRule("zomato",           "Food & Dining");
-        addRule("swiggy",           "Food & Dining");
-        addRule("eatsure",          "Food & Dining");
-        addRule("faasos",           "Food & Dining");
-        addRule("box8",             "Food & Dining");
-        addRule("behrouz",          "Food & Dining");
-        addRule("freshmenu",        "Food & Dining");
-        addRule("mcdonald",         "Food & Dining");
-        addRule("dominos",          "Food & Dining");   // covers "Dominospizza"
-        addRule("dominospizza",     "Food & Dining");
-        addRule("pizza hut",        "Food & Dining");
-        addRule("pizzahut",         "Food & Dining");
-        addRule("kfc",              "Food & Dining");
-        addRule("subway",           "Food & Dining");
-        addRule("starbucks",        "Food & Dining");
-        addRule("chaayos",          "Food & Dining");
-        addRule("chai point",       "Food & Dining");
-        addRule("burger king",      "Food & Dining");
-        addRule("barbeque",         "Food & Dining");
-        addRule("restaurant",       "Food & Dining");
-        addRule("bistro",           "Food & Dining");   // covers BISTRO in stmt
-        addRule("dhaba",            "Food & Dining");
-        addRule("bakery",           "Food & Dining");
-        addRule("canteen",          "Food & Dining");
-        addRule("cafe",             "Food & Dining");
-        addRule("coffee",           "Food & Dining");   // covers "Coffee Makers"
-        addRule("tea",              "Food & Dining");
-
-        // ── 3. Groceries ─────────────────────────────────────────────────────
-        addRule("blinkit",          "Groceries");       // covers "blinki" prefix too
-        addRule("blinki",           "Groceries");       // Axis truncates to "blinki"
-        addRule("zepto",            "Groceries");
-        addRule("bigbasket",        "Groceries");
-        addRule("big basket",       "Groceries");
-        addRule("grofers",          "Groceries");
-        addRule("dmart",            "Groceries");
-        addRule("d-mart",           "Groceries");
-        addRule("reliance fresh",   "Groceries");
-        addRule("reliance smart",   "Groceries");
-        addRule("more retail",      "Groceries");
-        addRule("spencer",          "Groceries");
-        addRule("milkbasket",       "Groceries");
-        addRule("dunzo",            "Groceries");
-        addRule("instamart",        "Groceries");
-        addRule("jiomart",          "Groceries");
-        addRule("supermart",        "Groceries");
-        addRule("daily basket",     "Groceries");
-        addRule("grocery",          "Groceries");
-
-        // ── 4. Shopping ──────────────────────────────────────────────────────
-        addRule("amazon",           "Shopping");
-        addRule("flipkart",         "Shopping");
-        addRule("myntra",           "Shopping");
-        addRule("nykaa",            "Shopping");
-        addRule("meesho",           "Shopping");
-        addRule("ajio",             "Shopping");
-        addRule("snapdeal",         "Shopping");
-        addRule("tatacliq",         "Shopping");
-        addRule("shopsy",           "Shopping");
-        addRule("lenskart",         "Shopping");
-        addRule("pepperfry",        "Shopping");
-        addRule("urban ladder",     "Shopping");
-        addRule("ikea",             "Shopping");
-        addRule("firstcry",         "Shopping");
-        addRule("westside",         "Shopping");
-        addRule("max fashion",      "Shopping");
-        addRule("shoppers stop",    "Shopping");
-        addRule("croma",            "Shopping");
-        addRule("vijay sales",      "Shopping");
-        addRule("reliance digital", "Shopping");
-        addRule("miniso",           "Shopping");        // covers "Miniso Lulu"
-        addRule("ekart",            "Shopping");
-        addRule("delhivery",        "Shopping");        // logistics → shopping delivery
-        addRule("marketplace pri",  "Shopping");        // covers "ZEPTO MARKETPLACE PRI"
-        addRule("culinary brands",  "Shopping");        // "Culinary Brands India/Amazon RBL"
-        addRule("urbancompany",     "Shopping");        // home services but treat as shopping
-        addRule("urban company",    "Shopping");
-
-        // ── 5. Transport ─────────────────────────────────────────────────────
-        addRule("uber",             "Transport");
-        addRule("ola ",             "Transport");       // trailing space avoids "ola" in "cola"
-        addRule("rapido",           "Transport");
-        addRule("roppen",           "Transport");
-        addRule("yulu",             "Transport");
-        addRule("bounce",           "Transport");
-        addRule("irctc",            "Transport");
-        addRule("indian rail",      "Transport");
-        addRule("railwire",         "Transport");
-        addRule("redbus",           "Transport");
-        addRule("abhibus",          "Transport");
-        addRule("indigo",           "Transport");       // covers "INDIGO AIRLINE"
-        addRule("indigo airline",   "Transport");
-        addRule("air india",        "Transport");
-        addRule("spicejet",         "Transport");
-        addRule("akasa",            "Transport");
-        addRule("goair",            "Transport");
-        addRule("vistara",          "Transport");
-        addRule("fastag",           "Transport");
-        addRule("filling station",  "Transport");       // "L N B FILLING STATION"
-        addRule("petrol pump",      "Transport");
-        addRule("parking",          "Transport");
-
-        // ── 6. Fuel ──────────────────────────────────────────────────────────
-        addRule("petrol",           "Fuel");
-        addRule("diesel",           "Fuel");
-        addRule("iocl",             "Fuel");
-        addRule("bpcl",             "Fuel");
-        addRule("hpcl",             "Fuel");
-        addRule("hp pump",          "Fuel");
-        addRule("cng",              "Fuel");
-
-        // ── 7. Utilities / Bills ─────────────────────────────────────────────
-        addRule("airtel",           "Utilities");       // covers "AIRTEL PAYMENTS BANK" recharge
-        addRule("jio",              "Utilities");
-        addRule("bsnl",             "Utilities");
-        addRule("vodafone",         "Utilities");
-        addRule(" vi ",             "Utilities");
-        addRule("electricity",      "Utilities");
-        addRule("bses",             "Utilities");
-        addRule("bescom",           "Utilities");
-        addRule("msedcl",           "Utilities");
-        addRule("tpddl",            "Utilities");
-        addRule("tata power",       "Utilities");
-        addRule("adani elec",       "Utilities");
-        addRule("broadband",        "Utilities");
-        addRule("act fibernet",     "Utilities");
-        addRule("hathway",          "Utilities");
-        addRule("excitel",          "Utilities");
-        addRule("mahanagar gas",    "Utilities");
-        addRule("indraprastha",     "Utilities");
-        addRule("bbps",             "Utilities");
-        addRule("municipality",     "Utilities");
-        addRule("water bill",       "Utilities");
-        addRule("gas bill",         "Utilities");
-        addRule("recharge",         "Utilities");
-
-        // ── 8. Subscriptions ─────────────────────────────────────────────────
-        addRule("netflix",          "Subscriptions");
-        addRule("hotstar",          "Subscriptions");
-        addRule("disney",           "Subscriptions");
-        addRule("prime video",      "Subscriptions");
-        addRule("zee5",             "Subscriptions");
-        addRule("sonyliv",          "Subscriptions");
-        addRule("mxplayer",         "Subscriptions");
-        addRule("jiocinema",        "Subscriptions");
-        addRule("spotify",          "Subscriptions");
-        addRule("gaana",            "Subscriptions");
-        addRule("jiosaavn",         "Subscriptions");
-        addRule("wynk",             "Subscriptions");
-        addRule("youtube premium",  "Subscriptions");
-        addRule("google one",       "Subscriptions");
-        addRule("icloud",           "Subscriptions");
-        addRule("dropbox",          "Subscriptions");
-        addRule("canva",            "Subscriptions");
-        addRule("grammarly",        "Subscriptions");
-        addRule("notion",           "Subscriptions");
-        addRule("github",           "Subscriptions");
-        addRule("chatgpt",          "Subscriptions");
-        addRule("openai",           "Subscriptions");
-        addRule("microsoft 365",    "Subscriptions");
-        addRule("office 365",       "Subscriptions");
-        addRule("adobe",            "Subscriptions");
-        addRule("figma",            "Subscriptions");
-        addRule("apple med",        "Subscriptions");  // "APPLE MED" = Apple One / iCloud+
-        addRule("apple",            "Subscriptions");
-
-        // ── 9. Entertainment ─────────────────────────────────────────────────
-        addRule("bookmyshow",       "Entertainment");
-        addRule("pvr",              "Entertainment");
-        addRule("inox",             "Entertainment");
-        addRule("cinepolis",        "Entertainment");
-        addRule("steam",            "Entertainment");
-        addRule("playstation",      "Entertainment");
-        addRule("xbox",             "Entertainment");
-        addRule("gaming",           "Entertainment");
-        addRule("playgames",        "Entertainment");
-
-        // ── 10. Healthcare ────────────────────────────────────────────────────
-        addRule("apollo",           "Healthcare");
-        addRule("practo",           "Healthcare");
-        addRule("1mg",              "Healthcare");
-        addRule("pharmeasy",        "Healthcare");
-        addRule("netmeds",          "Healthcare");
-        addRule("medplus",          "Healthcare");
-        addRule("healthians",       "Healthcare");
-        addRule("thyrocare",        "Healthcare");
-        addRule("hospital",         "Healthcare");
-        addRule("pharmacy",         "Healthcare");
-        addRule("medical",          "Healthcare");
-        addRule("diagnostic",       "Healthcare");
-        addRule("ashok pharma",     "Healthcare");     // "ASHOK PHARMA" in statement
-        addRule("pharma",           "Healthcare");
-        addRule("clinic",           "Healthcare");
-        addRule("cult.fit",         "Healthcare");
-        addRule("cure.fit",         "Healthcare");
-        addRule("curefit",          "Healthcare");
-        addRule("doctor",           "Healthcare");
-        addRule("lab test",         "Healthcare");
-
-        // ── 11. Investment ────────────────────────────────────────────────────
-        addRule("zerodha",          "Investment");      // covers "ICCL ZERODHA"
-        addRule("iccl",             "Investment");      // ICCL = NSE clearing (Zerodha)
-        addRule("groww",            "Investment");
-        addRule("upstox",           "Investment");
-        addRule("angel",            "Investment");
-        addRule("mutual fund",      "Investment");
-        addRule("sbimf",            "Investment");
-        addRule("hdfcmf",           "Investment");
-        addRule("nps",              "Investment");
-        addRule("ppf",              "Investment");
-        addRule("lic ",             "Investment");
-        addRule("insurance",        "Investment");
-        addRule("icici pru",        "Investment");
-        addRule("hdfc life",        "Investment");
-        addRule("sip",              "Investment");
-        addRule("gold bond",        "Investment");
-        addRule("smallcase",        "Investment");
-        addRule("coin by",          "Investment");
-
-        // ── 12. Education ─────────────────────────────────────────────────────
-        addRule("udemy",            "Education");
-        addRule("coursera",         "Education");
-        addRule("unacademy",        "Education");
-        addRule("byju",             "Education");
-        addRule("vedantu",          "Education");
-        addRule("upgrad",           "Education");
-        addRule("simplilearn",      "Education");
-        addRule("physicswallah",    "Education");
-        addRule("school fee",       "Education");
-        addRule("school/trf",       "Education");      // "B R INTERNATIONAL PUBLIC SCHOOL/trf"
-        addRule("public school",    "Education");
-        addRule("tuition",          "Education");
-        addRule("coaching",         "Education");
-        addRule("college fee",      "Education");
-        addRule("university",       "Education");
-
-        // ── 13. Rent ──────────────────────────────────────────────────────────
-        addRule("nobroker",         "Rent");
-        addRule("nestaway",         "Rent");
-        addRule("house rent",       "Rent");
-        addRule("flat rent",        "Rent");
-        addRule("pg rent",          "Rent");
-        addRule("rental",           "Rent");
-        addRule("magicbricks",      "Rent");
-        addRule("99acres",          "Rent");
-
-        // ── 14. ATM / Cash Withdrawal ─────────────────────────────────────────
-        addRule("cash withdraw",    "Cash Withdrawal");
-        addRule("atm ",             "Cash Withdrawal");
-        addRule("cdm",              "Cash Withdrawal");
-        addRule("cwdr",             "Cash Withdrawal");
-
-        // ── 15. Credit-side categories (for CREDIT transactions) ──────────────
-        // These are handled in categorise(desc, type) below, not here.
-        // Listing them here would misfire on debit side.
-
-        // ── 16. Tax / Government ──────────────────────────────────────────────
-        addRule("income tax",       "Tax");
-        addRule("gst",              "Tax");
-        addRule("tds",              "Tax");
-        addRule("epfo",             "Tax");
-        addRule("pf ",              "Tax");
-
-        // ── 17. Personal Care ─────────────────────────────────────────────────
-        addRule("salon",            "Personal Care");
-        addRule("haircut",          "Personal Care");
-        addRule("spa",              "Personal Care");
-        addRule("beauty",           "Personal Care");
-        addRule("nails",            "Personal Care");
-
-        // ── 18. Charitable / Religious ────────────────────────────────────────
-        addRule("temple",           "Charitable");
-        addRule("donation",         "Charitable");
-        addRule("charity",          "Charitable");
-        addRule("ngo",              "Charitable");
+    public TransactionMapper(MerchantRegistry merchantRegistry) {
+        this.merchantRegistry = merchantRegistry;
     }
-
-    private static void addRule(String keyword, String category) {
-        KEYWORD_RULES.add(new String[]{keyword.toLowerCase(), category});
-    }
-
-    // ── Set of known commercial services for P2P detection ───────────────────
-    private static final Set<String> KNOWN_SERVICES = new HashSet<>(Arrays.asList(
-            "zomato","swiggy","netflix","hotstar","spotify","amazon","flipkart",
-            "airtel","zepto","blinkit","blinki","bigbasket","uber","ola","rapido",
-            "canva","grammarly","notion","zoom","github","google","icloud","dropbox",
-            "paytm","phonepe","razorpay","cashfree","bharatpe","curefit","bookmyshow",
-            "pvr","inox","dominos","mcdonald","kfc","visage","myntra","nykaa","meesho",
-            "dunzo","grofers","dmart","bistro","disney","zee5","sonyliv","jiocinema",
-            "practo","1mg","pharmeasy","netmeds","zerodha","groww","upstox","angel",
-            "byju","unacademy","udemy","indigo","spicejet","irctc","redbus","abhibus",
-            "swiggy","eatsure","freshmenu","openai","chatgpt","apple","microsoft",
-            "actfibernet","excitel","hathway","urbancompany","urban company","miniso",
-            "delhivery","ekart","marketplace","filling station","culinary","starbucks",
-            "ashok pharma","coffee","iccl","lulu","urbancomp"
-    ));
 
     // ═════════════════════════════════════════════════════════════════════════
     // mapRowToTransaction
@@ -413,18 +94,17 @@ public class TransactionMapper {
         } else if (credit != null && debit == null) {
             type = Transaction.Type.CREDIT;  amount = credit;
         } else {
-            // Both columns filled — prefer balance-delta context if we had it
-            // (parser already resolved this; fall back to description)
             boolean creditSig = isCreditKeyword(desc);
             type   = creditSig ? Transaction.Type.CREDIT : Transaction.Type.DEBIT;
             amount = creditSig ? credit : debit;
         }
 
-        String category = categorise(desc, type);
+        // Delegate categorisation to MerchantRegistry
+        CategoryResult cat = merchantRegistry.resolve(desc, type);
 
-        log.debug("TX {} | {} | {} | ₹{} | {}",
-                date, type, category, amount,
-                desc.substring(0, Math.min(desc.length(), 60)));
+        log.debug("TX {} | {} | {} ({}) conf={} | ₹{} | {}",
+                date, type, cat.category(), cat.source(), String.format("%.2f", cat.confidence()),
+                amount, desc.substring(0, Math.min(desc.length(), 60)));
 
         return Transaction.builder()
                 .statement(statement)
@@ -433,75 +113,23 @@ public class TransactionMapper {
                 .amount(amount)
                 .type(type)
                 .balance(balance)
-                .category(category)
+                .category(cat.category())
+                .subCategory(cat.subCategory())
+                .categoryConfidence(cat.confidence())
+                .categorySource(cat.source())
                 .build();
     }
 
     // ═════════════════════════════════════════════════════════════════════════
-    // CATEGORISE — main public entry point
+    // cleanMerchant — delegates to MerchantRegistry
     // ═════════════════════════════════════════════════════════════════════════
 
-    /**
-     * Categorises a transaction description.
-     *
-     * Strategy (in order):
-     *   1. Credit-side income signals (salary, refund, interest, etc.)
-     *   2. Keyword table (KEYWORD_RULES) — first match wins
-     *   3. P2P heuristic for UPI transfers to individuals
-     *   4. Generic NEFT/RTGS/IMPS → "Bank Transfer"
-     *   5. Fallback → "Other"
-     */
-    public String categorise(String description, Transaction.Type type) {
-        if (description == null || description.isBlank()) return "Other";
-        String lo = description.toLowerCase();
-
-        // ── Step 1: Credit-side income ────────────────────────────────────────
-        if (type == Transaction.Type.CREDIT) {
-            if (lo.contains("salary")  || lo.contains("payroll") || lo.contains("stipend"))
-                return "Salary";
-            if (lo.contains("interest") && !lo.contains("loan"))
-                return "Interest";
-            if (lo.contains("refund") || lo.contains("cashback") || lo.contains("reversal"))
-                return "Refund";
-            if (lo.contains("dividend"))
-                return "Dividend";
-            // School / institution credit → Income (not "Education")
-            if (lo.contains("school") || lo.contains("college") || lo.contains("university"))
-                return "Income";
-        }
-
-        // ── Step 2: Merchant keyword table ───────────────────────────────────
-        for (String[] rule : KEYWORD_RULES) {
-            if (lo.contains(rule[0])) return rule[1];
-        }
-
-        // ── Step 3: P2P transfer heuristic ───────────────────────────────────
-        // A UPI P2P has the pattern UPI/P2A/... (person-to-account) or
-        // UPI/P2P and none of the known service keywords matched above.
-        if (isP2P(lo)) return "P2P Transfer";
-
-        // ── Step 4: Generic bank transfer ────────────────────────────────────
-        if (lo.contains("neft") || lo.contains("rtgs") || lo.contains("imps")
-                || lo.contains("trf") || lo.contains("transfer"))
-            return "Bank Transfer";
-
-        // ── Step 5: Catch HDFC collection charges (Zomato routes through HDFC)
-        // "/Collec/HDFC BANK LTD" appears repeatedly in this statement.
-        // These are merchant collections — already caught by "zomato" above if
-        // "zomato" is anywhere in the description.  If it reaches here it means
-        // the merchant name was stripped by PDF parser — label it "Merchant Payment".
-        if (lo.contains("collec") && lo.contains("hdfc"))
-            return "Merchant Payment";
-
-        return "Other";
-    }
-
-    public String categorise(String description) {
-        return categorise(description, Transaction.Type.DEBIT);
+    public String cleanMerchant(String raw) {
+        return merchantRegistry.normalize(raw);
     }
 
     // ═════════════════════════════════════════════════════════════════════════
-    // deriveInsights — full behavioral insight suite
+    // deriveInsights — unchanged from original
     // ═════════════════════════════════════════════════════════════════════════
 
     public List<TransactionInsight> deriveInsights(Statement statement, List<Transaction> txns) {
@@ -540,7 +168,7 @@ public class TransactionMapper {
         BigDecimal avgDay = totalDebit.compareTo(BigDecimal.ZERO) == 0 ? BigDecimal.ZERO
                 : totalDebit.divide(BigDecimal.valueOf(totalDays), 0, RoundingMode.HALF_UP);
 
-        // ── 1. SUMMARY ────────────────────────────────────────────────────────
+        // ── SUMMARY ───────────────────────────────────────────────────────────
         out.add(ins(statement, "SUMMARY", "Total Spent",        "₹" + fmt(totalDebit),  null));
         out.add(ins(statement, "SUMMARY", "Total Received",     "₹" + fmt(totalCredit), null));
         out.add(ins(statement, "SUMMARY", "Net Flow",           "₹" + fmt(netFlow),     null));
@@ -550,7 +178,7 @@ public class TransactionMapper {
         out.add(ins(statement, "SUMMARY", "Savings Rate",       savingsRate + "%",
                 savingsRate.compareTo(BigDecimal.valueOf(20)) < 0 ? "⚠ Below recommended 20%" : "✓ Healthy"));
 
-        // ── 2. INCOME ─────────────────────────────────────────────────────────
+        // ── INCOME ────────────────────────────────────────────────────────────
         if (credits.isEmpty()) {
             out.add(ins(statement, "INCOME", "No Income Detected", "₹0.00",
                     "No credit found in this period"));
@@ -564,7 +192,7 @@ public class TransactionMapper {
                             "Credited on " + t.getDate())));
         }
 
-        // ── 3. CATEGORY BREAKDOWN ─────────────────────────────────────────────
+        // ── CATEGORY BREAKDOWN ────────────────────────────────────────────────
         Map<String, BigDecimal> byCategory = debits.stream()
                 .collect(Collectors.groupingBy(
                         t -> t.getCategory() != null ? t.getCategory() : "Other",
@@ -580,7 +208,7 @@ public class TransactionMapper {
                             "₹" + fmt(e.getValue()), pct + "%"));
                 });
 
-        // ── 4. TOP MERCHANTS ──────────────────────────────────────────────────
+        // ── TOP MERCHANTS ─────────────────────────────────────────────────────
         debits.stream()
                 .collect(Collectors.groupingBy(
                         t -> cleanMerchant(t.getDescription()),
@@ -591,7 +219,7 @@ public class TransactionMapper {
                 .forEach(e -> out.add(ins(statement, "TOP_MERCHANT",
                         e.getKey(), "₹" + fmt(e.getValue()), null)));
 
-        // ── 5. SUBSCRIPTION DETECTION ─────────────────────────────────────────
+        // ── SUBSCRIPTION DETECTION ────────────────────────────────────────────
         debits.stream()
                 .filter(t -> "Subscriptions".equals(t.getCategory()))
                 .collect(Collectors.groupingBy(
@@ -608,7 +236,7 @@ public class TransactionMapper {
                                     + fmt(monthly.multiply(BigDecimal.valueOf(12))) + "/yr"));
                 });
 
-        // ── 6. P2P RECURRING ─────────────────────────────────────────────────
+        // ── P2P RECURRING ─────────────────────────────────────────────────────
         debits.stream()
                 .filter(t -> "P2P Transfer".equals(t.getCategory()))
                 .collect(Collectors.groupingBy(t -> cleanMerchant(t.getDescription())))
@@ -626,7 +254,7 @@ public class TransactionMapper {
                             e.getKey(), "₹" + fmt(total), meta));
                 });
 
-        // ── 7. MONTHLY TREND ─────────────────────────────────────────────────
+        // ── MONTHLY TREND ─────────────────────────────────────────────────────
         debits.stream()
                 .collect(Collectors.groupingBy(
                         t -> t.getDate().format(DateTimeFormatter.ofPattern("MMM yyyy")),
@@ -634,7 +262,7 @@ public class TransactionMapper {
                 .forEach((month, total) ->
                         out.add(ins(statement, "MONTHLY_TREND", month, "₹" + fmt(total), null)));
 
-        // ── 8. WEEKLY BREAKDOWN ───────────────────────────────────────────────
+        // ── WEEKLY BREAKDOWN ──────────────────────────────────────────────────
         Map<Integer, List<Transaction>> byWeek = debits.stream()
                 .collect(Collectors.groupingBy(t -> weekOfMonth(t.getDate())));
         for (int w = 1; w <= 4; w++) {
@@ -647,7 +275,7 @@ public class TransactionMapper {
                     wPct + "% of monthly spend · " + wTxs.size() + " transactions"));
         }
 
-        // ── 9. DAILY SPEND SERIES ─────────────────────────────────────────────
+        // ── DAILY SPEND SERIES ────────────────────────────────────────────────
         StringBuilder series = new StringBuilder("[");
         boolean first = true;
         for (LocalDate d : allDates) {
@@ -661,7 +289,7 @@ public class TransactionMapper {
         series.append("]");
         out.add(ins(statement, "DAILY_SPEND_SERIES", "Daily Chart Data", series.toString(), null));
 
-        // ── 10. LARGEST TRANSACTIONS ──────────────────────────────────────────
+        // ── LARGEST TRANSACTIONS ──────────────────────────────────────────────
         debits.stream()
                 .sorted(Comparator.comparing(Transaction::getAmount).reversed())
                 .limit(5)
@@ -670,16 +298,14 @@ public class TransactionMapper {
                         "₹" + fmt(t.getAmount()),
                         t.getDate().toString())));
 
-        // ── 11. BEHAVIORAL INTELLIGENCE ───────────────────────────────────────
+        // ── BEHAVIORAL INTELLIGENCE ───────────────────────────────────────────
 
-        // Average daily spend
         LocalDate peakDay = dailyDebit.entrySet().stream()
                 .max(Map.Entry.comparingByValue()).map(Map.Entry::getKey).orElse(null);
         out.add(ins(statement, "BEHAVIORAL", "Avg Daily Spend", "₹" + fmt(avgDay),
                 peakDay != null ? "Highest on "
                         + peakDay.format(DateTimeFormatter.ofPattern("d MMM")) : null));
 
-        // Weekend vs weekday
         BigDecimal weekendSpend = sum(debits.stream().filter(t -> isWeekend(t.getDate())).toList());
         BigDecimal weekdaySpend = sum(debits.stream().filter(t -> !isWeekend(t.getDate())).toList());
         long wkendDays = debits.stream().filter(t -> isWeekend(t.getDate())).map(Transaction::getDate).distinct().count();
@@ -695,7 +321,6 @@ public class TransactionMapper {
             }
         }
 
-        // Micro / impulse UPI payments < ₹200
         List<Transaction> micro = debits.stream()
                 .filter(t -> t.getAmount().compareTo(BigDecimal.valueOf(200)) < 0).toList();
         BigDecimal microTotal = sum(micro);
@@ -705,7 +330,6 @@ public class TransactionMapper {
                     micro.size() + " payments under ₹200 · avg ₹" + fmt(microAvg)));
         }
 
-        // Post-salary drain (3 days after largest credit)
         credits.stream().max(Comparator.comparing(Transaction::getAmount)).ifPresent(salary -> {
             LocalDate sd = salary.getDate();
             BigDecimal drain = sum(debits.stream()
@@ -720,7 +344,6 @@ public class TransactionMapper {
             }
         });
 
-        // Food delivery habit
         List<Transaction> food = debits.stream()
                 .filter(t -> "Food & Dining".equals(t.getCategory())).toList();
         BigDecimal foodTotal = sum(food);
@@ -732,7 +355,6 @@ public class TransactionMapper {
                             + fmt(foodTotal.multiply(BigDecimal.valueOf(12))) + " projected/yr"));
         }
 
-        // Spending spikes (days that are 2× the average)
         BigDecimal doubleAvg = avgDay.multiply(BigDecimal.valueOf(2));
         if (doubleAvg.compareTo(BigDecimal.ZERO) > 0) {
             dailyDebit.entrySet().stream()
@@ -749,7 +371,6 @@ public class TransactionMapper {
                     });
         }
 
-        // Shopping frequency
         List<Transaction> shopping = debits.stream()
                 .filter(t -> "Shopping".equals(t.getCategory())).toList();
         if (!shopping.isEmpty()) {
@@ -759,7 +380,7 @@ public class TransactionMapper {
                     "Avg ₹" + fmt(shopTotal.divide(BigDecimal.valueOf(shopping.size()), 0, RoundingMode.HALF_UP)) + " per order"));
         }
 
-        // ── 12. FINANCIAL HEALTH ──────────────────────────────────────────────
+        // ── FINANCIAL HEALTH ──────────────────────────────────────────────────
         BigDecimal emiTotal = sum(debits.stream()
                 .filter(t -> "EMI / Loan".equals(t.getCategory())).toList());
         if (emiTotal.compareTo(BigDecimal.ZERO) > 0 && totalCredit.compareTo(BigDecimal.ZERO) > 0) {
@@ -786,7 +407,7 @@ public class TransactionMapper {
                             burnRate.compareTo(BigDecimal.valueOf(80))  > 0 ? "⚠ Very little left to save"   : "✓ Within limits"));
         }
 
-        // ── 13. SAVING OPPORTUNITIES ──────────────────────────────────────────
+        // ── SAVING OPPORTUNITIES ──────────────────────────────────────────────
         if (foodTotal.compareTo(BigDecimal.valueOf(500)) > 0) {
             BigDecimal save = pct40(foodTotal);
             out.add(ins(statement, "SAVING_OPPORTUNITY", "Cut food delivery by 40%",
@@ -807,6 +428,17 @@ public class TransactionMapper {
                     "Categorise recurring ones as Rent / Savings / Shared expenses"));
         }
 
+        // ── LOW CONFIDENCE FLAGS ─────────────────────────────────────────────
+        // Surface transactions that need user review
+        long lowConfidenceCount = debits.stream()
+                .filter(t -> t.getCategoryConfidence() != null && t.getCategoryConfidence() < 0.60)
+                .count();
+        if (lowConfidenceCount > 0) {
+            out.add(ins(statement, "DATA_QUALITY", "Low Confidence Categorizations",
+                    String.valueOf(lowConfidenceCount),
+                    lowConfidenceCount + " transactions need review — tap to correct"));
+        }
+
         return out;
     }
 
@@ -814,18 +446,6 @@ public class TransactionMapper {
     // PRIVATE HELPERS
     // ═════════════════════════════════════════════════════════════════════════
 
-    /** Returns true if description looks like a UPI P2P transfer to a person */
-    private boolean isP2P(String lower) {
-        if (!lower.contains("upi")) return false;
-        for (String svc : KNOWN_SERVICES) {
-            if (lower.contains(svc)) return false;
-        }
-        // Has person name pattern (P2A = person-to-account) or typical individual UPI
-        return lower.contains("p2a") || lower.contains("p2p")
-                || lower.matches(".*upi.*/[a-z]{2,}@.*");
-    }
-
-    /** Returns true if description contains credit-side signal words */
     private boolean isCreditKeyword(String desc) {
         if (desc == null) return false;
         String lo = desc.toLowerCase();
@@ -837,53 +457,6 @@ public class TransactionMapper {
                 lo.contains("deposit")  || lo.contains("inward")   ||
                 lo.contains("received") || lo.contains("payroll")  ||
                 (lo.contains("school") && lo.contains("trf"));
-    }
-
-    /**
-     * Produces a short clean merchant name from a raw UPI description.
-     * E.g. "UPI/P2M/609787981155/ZOMATO LIMITED /Zomato/YES BANK LIMITED YBS"
-     *   → "Zomato Limited"
-     */
-    public String cleanMerchant(String raw) {
-        if (raw == null) return "Unknown";
-
-        // 1. Remove UPI reference number noise
-        String s = raw
-                .replaceAll("(?i)UPI/P2[AMP]/\\d+/", " ")   // UPI/P2A|P2M|P2P/<refnum>/
-                .replaceAll("(?i)UPI/P2[AMP]/",        " ")   // without refnum
-                .replaceAll("(?i)/UPIInt/",            " ")
-                .replaceAll("(?i)/Sent u/",            " ")
-                .replaceAll("(?i)/Pay to/",            " ")
-                .replaceAll("(?i)/Pay To/",            " ")
-                .replaceAll("(?i)/Payvia/",            " ")
-                .replaceAll("(?i)/Paymen/",            " ")
-                .replaceAll("(?i)/Verifi/",            " ")
-                .replaceAll("(?i)/Collec/",            " ")
-                .replaceAll("(?i)/Blinki/",            " ")
-                .replaceAll("(?i)/Zomato/",            " Zomato ")
-                .replaceAll("(?i)/I0PaNu/",            " ")
-                .replaceAll("(?i)TRF/",                " ")
-                .replaceAll("@[^\\s/]+",               " ")   // @upihandle
-                .replaceAll("/[A-Z]{2,4} BANK.*",      " ")   // /HDFC BANK LTD YBS
-                .replaceAll("/[A-Z]{2,}$",             " ")   // trailing /AXIS etc.
-                .replaceAll("\\b\\d{6,}\\b",           " ")   // 6+ digit reference numbers
-                .replaceAll("[^a-zA-Z\\s]",            " ")   // keep only letters + space
-                .replaceAll("\\s+",                    " ")
-                .trim();
-
-        // 2. Title-case and take first 3 meaningful words
-        String[] parts = s.split("\\s+");
-        StringBuilder out = new StringBuilder();
-        int words = 0;
-        for (String p : parts) {
-            if (p.length() <= 1) continue;
-            if (out.length() > 0) out.append(" ");
-            out.append(Character.toUpperCase(p.charAt(0)))
-                    .append(p.substring(1).toLowerCase());
-            if (++words == 3) break;
-        }
-        return out.length() > 0 ? out.toString()
-                : raw.substring(0, Math.min(raw.length(), 25));
     }
 
     private boolean isWeekend(LocalDate d) {
@@ -924,8 +497,6 @@ public class TransactionMapper {
                 .statement(s).type(type).label(label).value(value).meta(meta).build();
     }
 
-    // ── Column extraction helpers ─────────────────────────────────────────────
-
     private String getCol(Map<String, String> row, String... keys) {
         for (String key : keys) {
             for (Map.Entry<String, String> e : row.entrySet()) {
@@ -937,8 +508,6 @@ public class TransactionMapper {
         }
         return null;
     }
-
-    // ── Date parsing ─────────────────────────────────────────────────────────
 
     private LocalDate parseDate(String raw) {
         if (raw == null) return null;

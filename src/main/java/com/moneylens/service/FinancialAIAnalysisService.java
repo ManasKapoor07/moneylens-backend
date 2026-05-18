@@ -16,98 +16,15 @@ import java.util.UUID;
 @Service
 public class FinancialAIAnalysisService {
 
-    private final FinancialProfileRepository
-            financialProfileRepository;
+    private final FinancialProfileRepository    financialProfileRepository;
+    private final FinancialAIAnalysisRepository analysisRepository;
+    private final StatementRepository           statementRepository;
+    private final OpenAIService                 openAIService;
+    private final ObjectMapper                  objectMapper;
 
-    private final FinancialAIAnalysisRepository
-            analysisRepository;
-
-    private final StatementRepository
-            statementRepository;
-
-    private final OpenAIService openAIService;
-
-    private final ObjectMapper objectMapper;
-
-    public FinancialAIAnalysisService(
-            FinancialProfileRepository financialProfileRepository,
-            FinancialAIAnalysisRepository analysisRepository,
-            StatementRepository statementRepository,
-            OpenAIService openAIService,
-            ObjectMapper objectMapper
-    ) {
-        this.financialProfileRepository =
-                financialProfileRepository;
-
-        this.analysisRepository =
-                analysisRepository;
-
-        this.statementRepository =
-                statementRepository;
-
-        this.openAIService =
-                openAIService;
-
-        this.objectMapper =
-                objectMapper;
-    }
-
-    public AIAnalysisResponse analyze(
-            UUID statementId
-    ) {
-
-        // =============================================
-        // RETURN SAVED ANALYSIS IF EXISTS
-        // =============================================
-
-        FinancialAIAnalysis existing =
-                analysisRepository
-                        .findByStatementId(statementId)
-                        .orElse(null);
-
-        try {
-
-            if (existing != null) {
-                return objectMapper.readValue(
-                        existing.getAnalysisJson(),
-                        AIAnalysisResponse.class
-                );
-            }
-
-            // =============================================
-            // LOAD PROFILE + STATEMENT
-            // =============================================
-
-            FinancialProfile profile =
-                    financialProfileRepository
-                            .findByStatementId(statementId)
-                            .orElseThrow(() ->
-                                    new RuntimeException(
-                                            "Financial profile not found"
-                                    )
-                            );
-
-            Statement statement =
-                    statementRepository
-                            .findById(statementId)
-                            .orElseThrow(() ->
-                                    new RuntimeException(
-                                            "Statement not found"
-                                    )
-                            );
-
-            String context = profile.getContextJson();
-
-            // =============================================
-            // PROMPT
-            // =============================================
-
-            // Using replace instead of formatted() to avoid
-            // IllegalFormatConversionException caused by literal
-            // % characters in the prompt body (e.g. "40% of salary").
-            // .formatted() treats every % as a format specifier.
-
-            String promptTemplate = """
+    // The analysis prompt — kept here so both analyze() overloads use
+    // the exact same prompt template.
+    private static final String ANALYSIS_PROMPT_TEMPLATE = """
 You are MoneyLens — a behavioral financial intelligence engine.
 
 Not a budgeting app. Not a bank bot. Not a coach.
@@ -143,6 +60,30 @@ TONE — NON-NEGOTIABLE
 - The "woah" moment comes from specificity, not drama
 
 ==================================================
+BEHAVIORAL SIGNALS — NARRATE, DO NOT INVENT
+==================================================
+The BEHAVIORAL SIGNALS section in the profile above contains pre-computed,
+evidence-backed signals. Each has a severity (HIGH / MEDIUM / LOW) and an
+evidence string containing the actual numbers.
+Your job:
+- Translate each fired signal into a 1–2 sentence human observation
+- Use the evidence string as your source of truth
+- Do NOT add signals that aren't listed
+- Do NOT soften HIGH severity signals
+- Do NOT speculate about emotional causes — describe observable behavior
+For behavioralSignals in the JSON response:
+  label       = signal type name in title case (e.g. "Salary Day Spike")
+  observation = 1–2 sentences using the evidence provided
+  emotion     = only if the behavioral pattern has a clear observable trigger
+                (e.g. "post-salary relief spending") — otherwise omit
+  intensity   = map severity: HIGH → 8-10, MEDIUM → 4-7, LOW → 1-3
+For hiddenPatterns:
+  Surface non-obvious connections between the signals.
+  Example: if SALARY_DAY_SPIKE + FOOD_DELIVERY_HABIT both fired,
+  the hidden pattern might be "stress relief spending concentrated post-payday."
+  Only state what the evidence supports.
+
+==================================================
 MANDATORY JSON — ALL FIELDS REQUIRED
 ==================================================
 
@@ -163,21 +104,13 @@ Return this exact structure. No extra keys. No missing keys.
     "stabilityScore": 0
   },
 
-  "risks": [
-    "..."
-  ],
+  "risks": [ "..." ],
 
-  "positiveHabits": [
-    "..."
-  ],
+  "positiveHabits": [ "..." ],
 
-  "recommendations": [
-    "..."
-  ],
+  "recommendations": [ "..." ],
 
-  "nextActions": [
-    "..."
-  ],
+  "nextActions": [ "..." ],
 
   "projections": [
     {
@@ -207,132 +140,6 @@ Return this exact structure. No extra keys. No missing keys.
 }
 
 ==================================================
-FIELD-BY-FIELD GUIDANCE
-==================================================
-
-summary:
-- 2-3 sentences max
-- Start with a behavior observation, not a number
-- Should feel like something a smart friend said about you
-- BAD: "Your total expenses this month were Rs.42,000."
-- GOOD: "You earn consistently but spend like the month has no end.
-  Most of your money disappears in the first week and you barely
-  notice it happening."
-
----
-
-moneyPersonality:
-- archetype: give the user a financial identity they instantly recognize
-  Valid archetypes (use these or create a better-fit one):
-  "The Leaky Bucket" - earns well, but money silently exits everywhere
-  "The Weekend Spender" - disciplined weekdays, unravels on weekends
-  "The Anxious Saver" - saves but from fear, not intention
-  "The Ghost Saver" - thinks they save but the number never grows
-  "The Reactive Spender" - spends in response to mood or events
-  "The Comfort Spender" - uses spending as emotional regulation
-  "The Almost Disciplined" - good habits with one costly blind spot
-- description: 2 short human lines. No fluff. No motivational language.
-  Describe the pattern, not a judgment.
-- trait: one of "impulsive", "cautious", "inconsistent", "disciplined"
-
----
-
-spendingPulse:
-- status: one of "volatile", "stable", "declining", "improving"
-- summary: single punchy sentence about their cash flow energy
-  BAD: "Cash flow shows irregular patterns."
-  GOOD: "Your money moves in bursts, not streams."
-  GOOD: "Income arrives clean. It leaves messy."
-  GOOD: "You're stable on paper. Unstable in practice."
-- stabilityScore: honest integer 0-100. Not flattering.
-  80-100 = genuinely stable
-  60-79 = mostly stable with real gaps
-  40-59 = inconsistent, noticeable volatility
-  20-39 = reactive and unpredictable
-  0-19 = high risk, urgent attention needed
-
----
-
-risks (minimum 4):
-- Real, specific, behavior-backed
-- BAD: "High discretionary spending detected."
-- GOOD: "You have no buffer. If income stops for 30 days,
-  your accounts hit zero."
-- GOOD: "You're dependent on Swiggy and Zomato for daily meals.
-  That's a Rs.6,000/month habit hiding as convenience."
-
----
-
-positiveHabits (minimum 2):
-- Highlight what's actually working
-- Honest - don't manufacture positivity if it isn't there
-- Phrase it as an observation, not praise
-
----
-
-recommendations (minimum 4):
-- Start with the single highest-impact change
-- Behavior-specific, not generic advice
-- BAD: "Consider creating a budget."
-- GOOD: "Set a Rs.3,000 weekly cash limit for the first 10 days
-  after salary. That's where most of your monthly leak happens."
-
----
-
-nextActions (minimum 4):
-- Things they can do this week, not this year
-- Simple. Immediate. Realistic.
-- BAD: "Build an emergency fund."
-- GOOD: "Move Rs.5,000 to a separate account today, label it
-  untouchable. Don't automate yet. Do it manually once to feel it."
-
----
-
-projections (minimum 3):
-- headline: the "woah" one-liner - make it land
-  BAD: "Food delivery spending is high."
-  GOOD: "Your food delivery habit costs you Rs.1.2L a year."
-- impact: translate the number into something real and tangible
-  BAD: "This is a significant amount."
-  GOOD: "That's a 7-day trip to Southeast Asia you're eating away."
-  GOOD: "That's 4 months of a SIP that could compound to Rs.8L in 10 years."
-  GOOD: "That's a new laptop every year going to subscriptions you forgot exist."
-- timeframe: "3 months" or "6 months" or "12 months" or "5 years" or "10 years"
-- type: "leak" or "opportunity" or "compounding" or "risk"
-
----
-
-behavioralSignals (minimum 3):
-- label: give the behavior a short memorable name
-  Examples: "Post-Salary Splurge", "The Sunday Drain",
-  "Convenience Dependency", "Phantom Subscriptions",
-  "Peer Transfer Loop", "Emotional Weekend Spending"
-- observation: specific and data-backed, in human language
-  BAD: "High spending observed post-salary credit."
-  GOOD: "You spend nearly half your salary within 3 days of receiving it.
-  By day 10, the account looks like end-of-month."
-- emotion: what emotional driver likely sits behind this behavior
-  One of: "impulsive", "anxious", "disciplined", "avoidant", "reactive"
-- intensity: 1-10 integer
-  1-3 = mild, barely noticeable
-  4-6 = moderate, worth watching
-  7-9 = strong pattern, actively shaping finances
-  10 = dominant behavior, urgent to address
-
----
-
-hiddenPatterns (minimum 3):
-- title: catchy and memorable, like a chapter title
-  Examples: "The Invisible Subscription Layer",
-  "The 3-Day Rule", "The Weekend Personality Split",
-  "The Delivery Dependency Loop"
-- insight: the observation they've never noticed, stated plainly
-  BAD: "Subscription charges detected across multiple platforms."
-  GOOD: "You're paying for 6 streaming services. You actively use 2.
-  The other 4 are Rs.1,400/month of pure habit."
-- category: "timing" or "merchant" or "category" or "behavioral"
-
-==================================================
 RETURN STRICT RAW JSON ONLY
 No markdown. No json wrapper. No text outside JSON.
 ==================================================
@@ -341,59 +148,104 @@ PROFILE:
 {{CONTEXT}}
 """;
 
-            String prompt = promptTemplate.replace(
-                    "{{CONTEXT}}",
-                    context
-            );
+    public FinancialAIAnalysisService(
+            FinancialProfileRepository financialProfileRepository,
+            FinancialAIAnalysisRepository analysisRepository,
+            StatementRepository statementRepository,
+            OpenAIService openAIService,
+            ObjectMapper objectMapper
+    ) {
+        this.financialProfileRepository = financialProfileRepository;
+        this.analysisRepository         = analysisRepository;
+        this.statementRepository        = statementRepository;
+        this.openAIService              = openAIService;
+        this.objectMapper               = objectMapper;
+    }
 
-            // =============================================
-            // CALL AI
-            // =============================================
+    // ── Public API ────────────────────────────────────────────────────────────
 
-            String aiResponse =
-                    openAIService.analyze(prompt);
+    /**
+     * Original per-statement analysis.
+     *
+     * Returns cached result if one exists, otherwise runs AI on the
+     * statement's FinancialProfile.contextJson.
+     *
+     * Still used for:
+     *   - Per-statement drill-down pages
+     *   - FinancialAIAnalysis entity (statement-scoped)
+     */
+    public AIAnalysisResponse analyze(UUID statementId) {
 
-            String cleaned =
-                    aiResponse
-                            .replace("```json", "")
-                            .replace("```", "")
-                            .trim();
+        // Return saved per-statement analysis if it exists
+        FinancialAIAnalysis existing = analysisRepository
+                .findByStatementId(statementId)
+                .orElse(null);
 
-            AIAnalysisResponse parsed =
-                    objectMapper.readValue(
-                            cleaned,
-                            AIAnalysisResponse.class
-                    );
+        try {
+            if (existing != null) {
+                return objectMapper.readValue(
+                        existing.getAnalysisJson(),
+                        AIAnalysisResponse.class
+                );
+            }
 
-            // =============================================
-            // PERSIST
-            // =============================================
+            // Load the per-statement profile context
+            FinancialProfile profile = financialProfileRepository
+                    .findByStatementId(statementId)
+                    .orElseThrow(() -> new RuntimeException("Financial profile not found"));
 
-            FinancialAIAnalysis analysis =
-                    new FinancialAIAnalysis();
+            Statement statement = statementRepository
+                    .findById(statementId)
+                    .orElseThrow(() -> new RuntimeException("Statement not found"));
 
-            analysis.setUser(
-                    statement.getUser()
-            );
+            // Run analysis
+            AIAnalysisResponse parsed = analyzeFromContext(profile.getContextJson());
 
+            // Persist per-statement analysis
+            String cleaned = objectMapper.writeValueAsString(parsed);
+            FinancialAIAnalysis analysis = new FinancialAIAnalysis();
+            analysis.setUser(statement.getUser());
             analysis.setStatement(statement);
-
             analysis.setAnalysisJson(cleaned);
-
             analysis.setModel("gpt-4o-mini");
-
             analysis.setPromptVersion("v2");
-
             analysis.setUpdatedAt(LocalDateTime.now());
-
             analysisRepository.save(analysis);
 
             return parsed;
 
         } catch (Exception e) {
-            throw new RuntimeException(
-                    "AI analysis failed", e
-            );
+            throw new RuntimeException("AI analysis failed", e);
+        }
+    }
+
+    /**
+     * NEW: Analyze from a pre-built context string.
+     *
+     * Used by UserProfileAggregatorService to run analysis on the merged,
+     * cross-statement context without needing a statementId.
+     *
+     * Does NOT persist — the caller (UserProfileAggregatorService) is
+     * responsible for writing the result to UserFinancialProfile.
+     *
+     * @param contextJson the rendered prompt context from AIContextBuilderService
+     * @return parsed AIAnalysisResponse
+     */
+    public AIAnalysisResponse analyzeFromContext(String contextJson) {
+        try {
+            String prompt = ANALYSIS_PROMPT_TEMPLATE.replace("{{CONTEXT}}", contextJson);
+
+            String aiResponse = openAIService.analyze(prompt);
+
+            String cleaned = aiResponse
+                    .replace("```json", "")
+                    .replace("```", "")
+                    .trim();
+
+            return objectMapper.readValue(cleaned, AIAnalysisResponse.class);
+
+        } catch (Exception e) {
+            throw new RuntimeException("AI analysis from context failed", e);
         }
     }
 }

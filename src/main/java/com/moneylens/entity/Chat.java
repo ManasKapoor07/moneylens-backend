@@ -50,8 +50,8 @@ public class Chat {
     @JoinColumn(name = "user_id", nullable = false)
     private User user;
 
-    @ManyToOne(fetch = FetchType.LAZY, optional = false)
-    @JoinColumn(name = "statement_id", nullable = false)
+    @ManyToOne(fetch = FetchType.LAZY, optional = true)   // ← was false
+    @JoinColumn(name = "statement_id", nullable = true)   // ← was false
     private Statement statement;
 
     @Column(length = 160)

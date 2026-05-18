@@ -24,6 +24,22 @@ import java.util.stream.Collectors;
 /**
  * Central chat orchestration service.
  *
+ * ── What changed from the previous version ───────────────────────────────────
+ *
+ *   buildFinancialContext() now reads from UserFinancialProfile (user-level,
+ *   cross-statement, merged) as the PRIMARY source of AI context.
+ *
+ *   The per-statement FinancialProfile and FinancialAIAnalysis are still used
+ *   as a FALLBACK (for users who have no UserFinancialProfile yet, or for
+ *   per-statement drill-down context enrichment).
+ *
+ *   The correction flow (reanalyseAndPersist) still updates the per-statement
+ *   profile AND then triggers an async full-profile rebuild via
+ *   UserProfileAggregatorService so both sources stay in sync.
+ *
+ *   Everything else — state machine, goal detection, plan creation, token
+ *   budget, all marker logic — is completely unchanged.
+ *
  * ── State machine summary ────────────────────────────────────────────────────
  *
  * Every inbound message is handled in a strict priority order:
@@ -259,17 +275,19 @@ public class ChatService {
             """;
 
     // ── Dependencies ──────────────────────────────────────────────────────────
-    private final ChatRepository                chatRepository;
-    private final FinancialProfileRepository    profileRepository;
-    private final FinancialAIAnalysisRepository analysisRepository;
-    private final StatementRepository           statementRepository;
-    private final UserRepository                userRepository;
-    private final GoalService                   goalService;
-    private final GoalPlanService               goalPlanService;
-    private final TokenBudgetService            tokenBudgetService;
-    private final ObjectMapper                  objectMapper;
-    private final RestTemplate                  restTemplate;
-    private final PlanCreationHelper            planCreationHelper;
+    private final ChatRepository                    chatRepository;
+    private final FinancialProfileRepository        profileRepository;
+    private final FinancialAIAnalysisRepository     analysisRepository;
+    private final StatementRepository               statementRepository;
+    private final UserRepository                    userRepository;
+    private final UserFinancialProfileRepository    userProfileRepository;        // ← NEW
+    private final UserProfileAggregatorService      userProfileAggregatorService; // ← NEW
+    private final GoalService                       goalService;
+    private final GoalPlanService                   goalPlanService;
+    private final TokenBudgetService                tokenBudgetService;
+    private final ObjectMapper                      objectMapper;
+    private final RestTemplate                      restTemplate;
+    private final PlanCreationHelper                planCreationHelper;
 
     @Value("${openai.api.key}")
     private String openaiApiKey;
@@ -280,23 +298,27 @@ public class ChatService {
             FinancialAIAnalysisRepository analysisRepository,
             StatementRepository statementRepository,
             UserRepository userRepository,
+            UserFinancialProfileRepository userProfileRepository,              // ← NEW
+            UserProfileAggregatorService userProfileAggregatorService,        // ← NEW
             PlanCreationHelper planCreationHelper,
             GoalService goalService,
             GoalPlanService goalPlanService,
             TokenBudgetService tokenBudgetService,
             ObjectMapper objectMapper
     ) {
-        this.chatRepository      = chatRepository;
-        this.profileRepository   = profileRepository;
-        this.analysisRepository  = analysisRepository;
-        this.statementRepository = statementRepository;
-        this.userRepository      = userRepository;
-        this.goalService         = goalService;
-        this.goalPlanService     = goalPlanService;
-        this.tokenBudgetService  = tokenBudgetService;
-        this.objectMapper        = objectMapper;
-        this.planCreationHelper  = planCreationHelper;
-        this.restTemplate        = new RestTemplate();
+        this.chatRepository               = chatRepository;
+        this.profileRepository            = profileRepository;
+        this.analysisRepository           = analysisRepository;
+        this.statementRepository          = statementRepository;
+        this.userRepository               = userRepository;
+        this.userProfileRepository        = userProfileRepository;             // ← NEW
+        this.userProfileAggregatorService = userProfileAggregatorService;     // ← NEW
+        this.goalService                  = goalService;
+        this.goalPlanService              = goalPlanService;
+        this.tokenBudgetService           = tokenBudgetService;
+        this.objectMapper                 = objectMapper;
+        this.planCreationHelper           = planCreationHelper;
+        this.restTemplate                 = new RestTemplate();
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -329,23 +351,11 @@ public class ChatService {
         appendMessage(chat, ChatMessage.Role.USER, userMessage);
 
         // ── 5. Snapshot conversation state BEFORE any mutations ───────────────
-        //
-        // We snapshot here so that all routing decisions in steps 6 and 7
-        // are based on the state at the START of this turn, not any
-        // intermediate state we may write during the turn.
         final String pendingPlanGoalName      = chat.getPendingPlanGoalName();
         final String justCreatedGoalName      = chat.getJustCreatedGoalName();
         final String pendingSuggestedGoalName = chat.getPendingSuggestedGoalName();
 
         // ── 6. P1: PENDING-SUGGESTION AUTO-CONFIRM ────────────────────────────
-        //
-        // A goal suggestion card is on screen (pendingSuggestedGoalName != null).
-        // If the user sends a short acceptance phrase ("weekly", "yes", "monthly"),
-        // auto-create the goal and jump straight to plan generation.
-        //
-        // We deliberately only do this for SHORT messages (≤ 40 chars).  A long
-        // message like "I want to save for an iPhone but also go to Goa" is a new
-        // goal mention, not a plan acceptance — it must flow through normal AI.
         if (pendingSuggestedGoalName != null && userMessage.trim().length() <= 40) {
             String acceptance = detectPlanAcceptance(userMessage, userId, user.getRole());
             if ("ACCEPT_WEEKLY".equals(acceptance) || "ACCEPT_MONTHLY".equals(acceptance)) {
@@ -357,13 +367,6 @@ public class ChatService {
         }
 
         // ── 7. P2: PLAN-OFFER RESPONSE ────────────────────────────────────────
-        //
-        // A plan offer is pending for an already-confirmed goal.
-        // If the user accepts → create the plan.
-        // If the user rejects → clear state and fall through to normal AI.
-        // If pendingSuggestedGoalName is also set, that means a NEW goal was
-        // suggested after the plan offer was sent; we skip P2 so the user can
-        // deal with the new suggestion first.
         if (pendingPlanGoalName != null && pendingSuggestedGoalName == null) {
             String acceptance = detectPlanAcceptance(userMessage, userId, user.getRole());
             if ("ACCEPT_WEEKLY".equals(acceptance) || "ACCEPT_MONTHLY".equals(acceptance)) {
@@ -377,16 +380,14 @@ public class ChatService {
                 chat.setPendingPlanGoalName(null);
                 chatRepository.save(chat);
             }
-            // REJECT or ambiguous — fall through to normal AI turn
         }
 
         // ── 8. P3: NORMAL AI TURN ─────────────────────────────────────────────
 
-        // 8a. Clear the one-turn justCreatedGoalName at the start of every new turn
-        //     (it was consumed in the previous turn's context injection)
+        // 8a. Clear one-turn justCreatedGoalName
         chat.setJustCreatedGoalName(null);
 
-        // 8b. Build financial context
+        // 8b. Build financial context — reads from UserFinancialProfile first
         String financialContext = buildFinancialContext(statementId, userId, justCreatedGoalName);
 
         // 8c. Build and call OpenAI
@@ -417,7 +418,7 @@ public class ChatService {
             }
         }
 
-        // 8e. Clean markers from the reply the user will see
+        // 8e. Clean markers from reply
         String cleanReply = rawReply
                 .replaceAll("---SUGGEST_GOAL---",        "")
                 .replaceAll("---OFFER_PLAN:[^\\n]*---",  "")
@@ -428,9 +429,6 @@ public class ChatService {
         appendMessage(chat, ChatMessage.Role.ASSISTANT, cleanReply);
 
         // ── 9. GOAL DETECTION ─────────────────────────────────────────────────
-        //
-        // Runs after the AI turn so we always have the full conversation context
-        // (including the AI's just-persisted reply) available.
         SuggestedGoal suggestedGoal    = null;
         boolean       isDuplicateGoal  = false;
         String        duplicateGoalName = null;
@@ -438,9 +436,6 @@ public class ChatService {
         if (shouldSuggestGoal) {
             String conversationContext = buildConversationContext(chat, userMessage);
 
-            // Pass the current pending suggestion name so the LLM suppresses it.
-            // Note: we use the CURRENT (live) value, not the snapshotted one,
-            // because the suggestion may have been updated already in this turn.
             GoalService.GoalSuggestionResult result =
                     goalService.detectGoalSuggestion(
                             userId,
@@ -451,8 +446,6 @@ public class ChatService {
             if (result.isDuplicate()) {
                 isDuplicateGoal   = true;
                 duplicateGoalName = result.duplicateGoalName();
-                // Only clear the pending suggestion if IT is the duplicate.
-                // If the pending suggestion is a DIFFERENT goal, preserve it.
                 if (duplicateGoalName != null
                         && duplicateGoalName.equalsIgnoreCase(chat.getPendingSuggestedGoalName())) {
                     chat.clearPendingSuggestion();
@@ -462,9 +455,6 @@ public class ChatService {
             } else if (result.goal() != null) {
                 String newGoalName = result.goal().name();
 
-                // Replace the pending suggestion ONLY if it's a genuinely different goal.
-                // This prevents overwriting an unconfirmed suggestion with itself on
-                // follow-up messages in the same topic thread.
                 if (!newGoalName.equalsIgnoreCase(chat.getPendingSuggestedGoalName())) {
                     log.info("New goal suggestion: '{}' (replacing pending suggestion '{}')",
                             newGoalName, chat.getPendingSuggestedGoalName());
@@ -473,32 +463,24 @@ public class ChatService {
                             result.goal().targetAmount(),
                             result.goal().targetDate()
                     );
-                    // replacePendingSuggestion() already clears pendingPlanGoalName
                 } else {
-                    log.debug("Same goal re-detected: '{}' — returning suggestion without state change",
+                    log.debug("Same goal re-detected: '{}' — returning without state change",
                             newGoalName);
                 }
                 suggestedGoal = result.goal();
 
             } else {
-                // AI appended ---SUGGEST_GOAL--- but extraction found nothing meaningful.
-                // This happens on vague messages like "I want to save something".
-                // Do NOT clear the pending suggestion — the user may still need to act on it.
-                log.debug("SUGGEST_GOAL marker fired but extraction found no goal; " +
-                        "preserving pending suggestion '{}'", chat.getPendingSuggestedGoalName());
+                log.debug("SUGGEST_GOAL fired but no goal extracted; preserving pending '{}'",
+                        chat.getPendingSuggestedGoalName());
             }
         }
 
         // ── 10. UPDATE CONVERSATION STATE FLAGS ───────────────────────────────
         if (shouldOfferPlan && offerPlanGoalName != null) {
-            // Entering plan-offer state: clear any stale suggestion first
             chat.clearPendingSuggestion();
             chat.setPendingPlanGoalName(offerPlanGoalName);
 
         } else if (shouldCreatePlan && createPlanGoalName != null) {
-            // AI decided to create the plan inline (rare — usually driven by
-            // explicit ---CREATE_PLAN--- in a follow-up where we already know
-            // frequency from context).
             chat.setPendingPlanGoalName(null);
             chat.clearPendingSuggestion();
             chat.setUpdatedAt(LocalDateTime.now());
@@ -528,16 +510,13 @@ public class ChatService {
     // CONFIRM GOAL VIA FRONTEND BUTTON
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /**
-     * Called when the user clicks the confirm button on a goal suggestion card.
-     * Creates the goal, transitions to plan-offer state, and returns the offer message.
-     */
     @Transactional
     public ChatResponse confirmGoalAndOfferPlan(UUID userId, UUID chatId, SuggestedGoal suggested) {
 
         Chat chat = chatRepository.findById(chatId)
                 .orElseThrow(() -> new IllegalArgumentException("Chat not found: " + chatId));
-        UUID statementId = chat.getStatement().getId();
+
+        UUID statementId = chat.getStatement() != null ? chat.getStatement().getId() : null;
 
         UserGoal saved = goalService.createGoal(
                 userId, statementId,
@@ -548,7 +527,6 @@ public class ChatService {
                 UserGoal.Source.AI_EXTRACTED
         );
 
-        // Transition: clear State A → enter State B
         chat.clearPendingSuggestion();
         chat.setJustCreatedGoalName(saved.getName());
         chat.setPendingPlanGoalName(saved.getName());
@@ -570,9 +548,9 @@ public class ChatService {
         return toMsgDtos(chat.getMessages());
     }
 
-    public List<Map<String, Object>> listChats(UUID userId, UUID statementId) {
+    public List<Map<String, Object>> listChats(UUID userId) {   // ← drop statementId param
         return chatRepository
-                .findByUserIdAndStatementIdOrderByUpdatedAtDesc(userId, statementId)
+                .findByUserIdOrderByUpdatedAtDesc(userId)       // ← new query
                 .stream().map(c -> {
                     Map<String, Object> m = new LinkedHashMap<>();
                     m.put("id",        c.getId());
@@ -586,11 +564,6 @@ public class ChatService {
     // P1 HELPER: AUTO-CONFIRM PENDING SUGGESTION + CREATE PLAN
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /**
-     * The user typed "weekly" / "yes" / "monthly" while a suggestion card was on
-     * screen.  We create the goal from the pending suggestion state and go straight
-     * to plan generation — no extra round-trip.
-     */
     @Transactional
     protected ChatResponse autoConfirmGoalAndCreatePlan(Chat chat, User user,
                                                         UUID statementId,
@@ -604,13 +577,12 @@ public class ChatService {
         UserGoal autoCreated = goalService.createGoal(
                 userId, statementId,
                 goalName, goalAmount,
-                null,     // currentSaved — not known at this stage
+                null,
                 goalDate,
                 UserGoal.Source.AI_EXTRACTED
         );
         log.info("Auto-confirmed pending suggestion '{}' for user {}", goalName, userId);
 
-        // Transition: clear State A and any stale State B before entering new State B
         chat.clearPendingSuggestion();
         chat.setPendingPlanGoalName(null);
         chatRepository.save(chat);
@@ -716,16 +688,9 @@ public class ChatService {
     // PLAN ACCEPTANCE DETECTION
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /**
-     * Classifies a user message as ACCEPT_WEEKLY, ACCEPT_MONTHLY, or REJECT.
-     *
-     * Fast-path: common words are handled without an LLM call.
-     * Slow-path: ambiguous messages go to GPT for classification.
-     */
     private String detectPlanAcceptance(String userMessage, UUID userId, User.Role role) {
         String lower = userMessage.toLowerCase().trim();
 
-        // Fast-path acceptances
         if (lower.matches("yes|yeah|yep|yup|sure|ok|okay|go ahead|please|" +
                 "sounds good|let's do it|do it|make it|create it|build it|yes please")) {
             return "ACCEPT_WEEKLY";
@@ -733,16 +698,12 @@ public class ChatService {
         if (lower.contains("weekly"))  return "ACCEPT_WEEKLY";
         if (lower.contains("monthly")) return "ACCEPT_MONTHLY";
 
-        // Fast-path rejections
         if (lower.matches("no|nope|not now|skip|cancel|never mind|maybe later")) {
             return "REJECT";
         }
 
-        // Anything longer than a typical acceptance phrase is unlikely to be one.
-        // Treat it as a regular message without burning tokens on classification.
         if (lower.length() > 60) return "REJECT";
 
-        // Slow-path: call LLM for genuinely ambiguous short messages
         String prompt = PLAN_ACCEPTANCE_PROMPT.formatted(userMessage);
         OpenAIResult result = callOpenAITracked(List.of(msg("user", prompt)), 10);
         tokenBudgetService.record(userId, result.totalTokens());
@@ -764,21 +725,32 @@ public class ChatService {
         UUID userId = user.getId();
         try {
             if (!isCorrection(userMessage, userId, user.getRole())) {
-                log.debug("No correction detected for statement {}", statementId);
+                log.debug("No correction detected for user {}", userId);
                 return;
             }
-            log.info("Correction detected for statement {} — triggering re-analysis + plan regen",
-                    statementId);
+            log.info("Correction detected for user {} (statementId={})", userId, statementId);
 
-            String updatedContext =
-                    reanalyseAndPersist(userId, statementId, userMessage, currentFinancialContext);
+            if (statementId != null) {
+                // Full flow: update per-statement profile AND rebuild user profile
+                String updatedContext = reanalyseAndPersist(
+                        userId, statementId, userMessage, currentFinancialContext);
 
-            if (updatedContext != null) {
-                goalPlanService.regeneratePendingTasksAfterCorrection(
-                        userId, userMessage, updatedContext);
+                if (updatedContext != null) {
+                    goalPlanService.regeneratePendingTasksAfterCorrection(
+                            userId, userMessage, updatedContext);
+                }
             }
+
+            // Always rebuild the user-level profile when a correction is detected,
+            // regardless of whether a statementId is present
+            log.info("Triggering full user profile rebuild after correction for user {}", userId);
+            userProfileAggregatorService.recomputeAsync(
+                    userId,
+                    UserProfileAggregatorService.REASON_USER_CORRECTION
+            );
+
         } catch (Exception e) {
-            log.error("Profile re-analysis failed for statement {}", statementId, e);
+            log.error("Profile re-analysis failed for user {} (statementId={})", userId, statementId, e);
         }
     }
 
@@ -892,9 +864,18 @@ public class ChatService {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // FINANCIAL CONTEXT BUILDER
+    // FINANCIAL CONTEXT BUILDER — UPDATED: UserFinancialProfile FIRST
     // ═══════════════════════════════════════════════════════════════════════════
 
+    /**
+     * Builds the financial context string injected into every AI prompt.
+     *
+     * Priority:
+     *   1. UserFinancialProfile (user-level, cross-statement, merged) — PRIMARY
+     *   2. Per-statement FinancialProfile + FinancialAIAnalysis — FALLBACK
+     *
+     * Goal context is always appended regardless of which source was used.
+     */
     private String buildFinancialContext(UUID statementId, UUID userId,
                                          String justCreatedGoalName) {
         StringBuilder ctx = new StringBuilder();
@@ -904,39 +885,90 @@ public class ChatService {
             ctx.append("[GOAL_JUST_CREATED: ").append(justCreatedGoalName).append("]\n\n");
         }
 
-        profileRepository.findByStatementId(statementId).ifPresent(profile -> {
-            ctx.append("HEALTH SCORE: ").append(profile.getHealthScore()).append("/100")
-                    .append(" | RISK: ").append(profile.getRiskLevel()).append("\n\n");
-            try {
-                String raw = profile.getContextJson();
-                if (raw != null && raw.trim().startsWith("{")) {
-                    Map<?, ?> map = objectMapper.readValue(raw, Map.class);
-                    Object text = map.get("promptText");
-                    ctx.append(text != null ? text.toString() : raw);
-                } else if (raw != null) {
-                    ctx.append(raw);
+        // ── PRIMARY: UserFinancialProfile ─────────────────────────────────────
+        Optional<UserFinancialProfile> userProfileOpt =
+                userProfileRepository.findByUserId(userId);
+
+        if (userProfileOpt.isPresent()) {
+            UserFinancialProfile up = userProfileOpt.get();
+
+            if (up.getPeriodFrom() != null && up.getPeriodTo() != null) {
+                ctx.append("DATA PERIOD: ")
+                        .append(up.getPeriodFrom()).append(" to ").append(up.getPeriodTo()).append("\n");
+            }
+            if (up.getStatementCount() != null) {
+                ctx.append("STATEMENTS ANALYSED: ").append(up.getStatementCount()).append("\n");
+            }
+            if (up.getTransactionCount() != null) {
+                ctx.append("TRANSACTIONS ANALYSED: ").append(up.getTransactionCount()).append("\n");
+            }
+            if (up.getHealthScore() != null) {
+                ctx.append("HEALTH SCORE: ").append(up.getHealthScore()).append("/100");
+            }
+            if (up.getRiskLevel() != null) {
+                ctx.append(" | RISK: ").append(up.getRiskLevel());
+            }
+            ctx.append("\n\n");
+
+            if (up.getContextJson() != null && !up.getContextJson().isBlank()) {
+                ctx.append("FINANCIAL CONTEXT:\n").append(up.getContextJson()).append("\n\n");
+            }
+
+            if (up.getAnalysisJson() != null && !up.getAnalysisJson().isBlank()) {
+                try {
+                    Map<?, ?> map = objectMapper.readValue(up.getAnalysisJson(), Map.class);
+                    appendSection(ctx, "PERSONALITY",    map, "moneyPersonality");
+                    appendSection(ctx, "SPENDING PULSE", map, "spendingPulse");
+                    appendList(ctx,    "KEY RISKS",       map, "risks");
+                    appendList(ctx,    "POSITIVE HABITS", map, "positiveHabits");
+                    appendList(ctx,    "HIDDEN PATTERNS", map, "hiddenPatterns");
+                } catch (Exception e) {
+                    log.warn("Failed to parse UserFinancialProfile analysisJson for user {}", userId, e);
+                    ctx.append("AI ANALYSIS:\n").append(up.getAnalysisJson()).append("\n\n");
                 }
-            } catch (Exception e) {
-                log.warn("Failed to parse contextJson for statement {}", statementId, e);
-                profileRepository.findByStatementId(statementId)
-                        .ifPresent(p -> ctx.append(p.getContextJson()));
             }
-            ctx.append("\n");
-        });
 
-        analysisRepository.findByStatementId(statementId).ifPresent(analysis -> {
-            try {
-                Map<?, ?> map = objectMapper.readValue(analysis.getAnalysisJson(), Map.class);
-                appendSection(ctx, "PERSONALITY",    map, "moneyPersonality");
-                appendSection(ctx, "SPENDING PULSE", map, "spendingPulse");
-                appendList(ctx,    "KEY RISKS",       map, "risks");
-                appendList(ctx,    "POSITIVE HABITS", map, "positiveHabits");
-                appendList(ctx,    "HIDDEN PATTERNS", map, "hiddenPatterns");
-            } catch (Exception e) {
-                log.warn("Failed to parse analysisJson for statement {}", statementId, e);
-            }
-        });
+            log.debug("Financial context built from UserFinancialProfile for user {}", userId);
 
+        } else {
+            // ── FALLBACK: per-statement ───────────────────────────────────────
+            log.debug("No UserFinancialProfile for user {} — using per-statement fallback", userId);
+
+            profileRepository.findByStatementId(statementId).ifPresent(profile -> {
+                ctx.append("HEALTH SCORE: ").append(profile.getHealthScore()).append("/100")
+                        .append(" | RISK: ").append(profile.getRiskLevel()).append("\n\n");
+                try {
+                    String raw = profile.getContextJson();
+                    if (raw != null && raw.trim().startsWith("{")) {
+                        Map<?, ?> map = objectMapper.readValue(raw, Map.class);
+                        Object text = map.get("promptText");
+                        ctx.append(text != null ? text.toString() : raw);
+                    } else if (raw != null) {
+                        ctx.append(raw);
+                    }
+                } catch (Exception e) {
+                    log.warn("Failed to parse contextJson for statement {}", statementId, e);
+                    profileRepository.findByStatementId(statementId)
+                            .ifPresent(p -> ctx.append(p.getContextJson()));
+                }
+                ctx.append("\n");
+            });
+
+            analysisRepository.findByStatementId(statementId).ifPresent(analysis -> {
+                try {
+                    Map<?, ?> map = objectMapper.readValue(analysis.getAnalysisJson(), Map.class);
+                    appendSection(ctx, "PERSONALITY",    map, "moneyPersonality");
+                    appendSection(ctx, "SPENDING PULSE", map, "spendingPulse");
+                    appendList(ctx,    "KEY RISKS",       map, "risks");
+                    appendList(ctx,    "POSITIVE HABITS", map, "positiveHabits");
+                    appendList(ctx,    "HIDDEN PATTERNS", map, "hiddenPatterns");
+                } catch (Exception e) {
+                    log.warn("Failed to parse analysisJson for statement {}", statementId, e);
+                }
+            });
+        }
+
+        // ── ALWAYS: goal context ──────────────────────────────────────────────
         String goalsCtx = goalService.buildGoalsContext(userId);
         if (goalsCtx != null && !goalsCtx.isBlank()) ctx.append(goalsCtx);
 
@@ -1064,12 +1096,13 @@ public class ChatService {
     }
 
     private Chat createChat(User user, UUID statementId, String firstMessage) {
-        Statement statement = statementRepository.findById(statementId)
-                .orElseThrow(() -> new IllegalArgumentException(
-                        "Statement not found: " + statementId));
         Chat chat = new Chat();
         chat.setUser(user);
-        chat.setStatement(statement);
+        if (statementId != null) {
+            Statement statement = statementRepository.findById(statementId)
+                    .orElseThrow(() -> new IllegalArgumentException("Statement not found"));
+            chat.setStatement(statement);
+        }
         chat.setTitle(truncate(firstMessage, 80));
         return chatRepository.save(chat);
     }

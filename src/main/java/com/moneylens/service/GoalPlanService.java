@@ -290,6 +290,7 @@ public class GoalPlanService {
     private final UserRepository         userRepository;
     private final TokenBudgetService     tokenBudgetService;
     private final ObjectMapper           objectMapper;
+    private final UserFinancialProfileRepository userProfileRepository;
     private final RestTemplate           restTemplate = new RestTemplate();
 
     @Value("${openai.api.key}")
@@ -300,13 +301,14 @@ public class GoalPlanService {
                            UserGoalRepository goalRepository,
                            UserRepository userRepository,
                            TokenBudgetService tokenBudgetService,
-                           ObjectMapper objectMapper) {
+                           ObjectMapper objectMapper, UserFinancialProfileRepository userProfileRepository) {
         this.planRepository      = planRepository;
         this.taskRepository      = taskRepository;
         this.goalRepository      = goalRepository;
         this.userRepository      = userRepository;
         this.tokenBudgetService  = tokenBudgetService;
         this.objectMapper        = objectMapper;
+        this.userProfileRepository = userProfileRepository;
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -806,7 +808,13 @@ public class GoalPlanService {
             goalRepository.save(goal);
         }
 
-        tryAutoUnlockNextChunk(plan, allTasks, financialContext);
+        // In GoalPlanService.checkIn(), replace the tryAutoUnlockNextChunk call:
+        String ctx = (financialContext != null) ? financialContext
+                : userProfileRepository.findByUserId(plan.getUser().getId())
+                .map(p -> p.getContextJson() + "\n" + p.getAnalysisJson())
+                .orElse("No profile available");
+        tryAutoUnlockNextChunk(plan, allTasks, ctx);
+
 
         return GoalPlanDto.from(planRepository.findById(planId).orElse(plan));
     }

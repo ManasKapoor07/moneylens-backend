@@ -45,7 +45,10 @@ public class ChatController {
         }
 
         UUID userId      = resolveUserId(auth);
-        UUID statementId = UUID.fromString((String) body.get("statementId"));
+        UUID statementId = body.get("statementId") != null
+                ? UUID.fromString((String) body.get("statementId"))
+                : null;
+
         UUID chatId      = body.get("chatId") != null
                 ? UUID.fromString((String) body.get("chatId"))
                 : null;
@@ -84,12 +87,9 @@ public class ChatController {
      * GET /api/v1/chat/list?statementId=...
      */
     @GetMapping("/list")
-    public ResponseEntity<Map<String, Object>> listChats(
-            Authentication auth,
-            @RequestParam UUID statementId
-    ) {
+    public ResponseEntity<Map<String, Object>> listChats(Authentication auth) {
         UUID userId = resolveUserId(auth);
-        return ResponseEntity.ok(Map.of("data", chatService.listChats(userId, statementId)));
+        return ResponseEntity.ok(Map.of("data", chatService.listChats(userId)));
     }
 
     // ── Inner DTO ──────────────────────────────────────────────────────────

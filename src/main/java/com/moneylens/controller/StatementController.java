@@ -11,7 +11,6 @@ import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.List;
-import java.util.UUID;
 
 @RestController
 @RequestMapping("/api/v1")
@@ -28,74 +27,21 @@ public class StatementController {
         this.dashboardService = dashboardService;
     }
 
-    @GetMapping("/dashboard/{statementId}")
+    @GetMapping("/dashboard")
     public ResponseEntity<ApiResponse<DashboardSummaryDto>> getDashboard(
-            @PathVariable UUID statementId,
             Authentication authentication
     ) {
-
         String email = authentication.getName();
-
         return ResponseEntity.ok(
                 ApiResponse.success(
                         "Dashboard loaded",
-                        dashboardService.buildSummary(statementId, email)
+                        dashboardService.buildSummary(email, null)
                 )
         );
     }
 
-    @GetMapping("/statements/{id}/weekly-spend")
-    public ResponseEntity<ApiResponse<List<WeeklySpendDto>>> getWeeklySpend(
-            @PathVariable UUID id,
-            Authentication authentication
-    ) {
-        String email = authentication.getName();
-        return ResponseEntity.ok(ApiResponse.success(
-                "Weekly spend fetched successfully",
-                statementService.getWeeklySpend(id, email)
-        ));
-    }
-
-
-    @GetMapping("/statements/{id}/recurring")
-    public ResponseEntity<ApiResponse<List<RecurringChargeDto>>> getRecurringCharges(
-            @PathVariable UUID id,
-            Authentication authentication
-    ) {
-        String email = authentication.getName();
-        return ResponseEntity.ok(ApiResponse.success(
-                "Recurring charges fetched successfully",
-                statementService.getRecurringCharges(id, email)
-        ));
-    }
-
-    @GetMapping("/statements")
-    public ResponseEntity<ApiResponse<List<StatementDetailDto>>> getAll(Authentication authentication) {
-        String email = authentication.getName();
-        return ResponseEntity.ok(ApiResponse.success("Statements fetched successfully", statementService.getAllForUser(email)));
-    }
-
-    // ⚠️ /ids MUST come before /{id} — otherwise Spring treats "ids" as a UUID path variable
-    @GetMapping("/statements/ids")
-    public ResponseEntity<ApiResponse<List<StatementIdWithBankDto>>> getStatementIds(
-            Authentication authentication) {
-        String email = authentication.getName();
-        return ResponseEntity.ok(ApiResponse.success(
-                "Statement IDs fetched successfully",
-                statementService.getIdsWithBankForUser(email)
-        ));
-    }
-
-    @GetMapping("/statements/{id}")
-    public ResponseEntity<ApiResponse<StatementDetailDto>> getOne(
-            @PathVariable UUID id, Authentication authentication) {
-        String email = authentication.getName();
-        return ResponseEntity.ok(ApiResponse.success("Statement fetched successfully", statementService.getOneForUser(id, email)));
-    }
-
-    @GetMapping("/statements/{id}/transactions")
-    public ResponseEntity<ApiResponse<PagedTransactionResponse>> getTransactions(
-            @PathVariable UUID id,
+    @GetMapping("/transactions")
+    public ResponseEntity<ApiResponse<PagedTransactionResponse>> getAllTransactions(
             @RequestParam(defaultValue = "0")    int page,
             @RequestParam(defaultValue = "20")   int size,
             @RequestParam(defaultValue = "date") String sort,
@@ -105,11 +51,69 @@ public class StatementController {
             Authentication authentication
     ) {
         int safeSize = Math.min(size, 100);
-        Sort.Direction direction = "asc".equalsIgnoreCase(dir) ? Sort.Direction.ASC : Sort.Direction.DESC;
+        Sort.Direction direction = "asc".equalsIgnoreCase(dir)
+                ? Sort.Direction.ASC : Sort.Direction.DESC;
         Pageable pageable = PageRequest.of(page, safeSize, Sort.by(direction, sort));
         String email = authentication.getName();
-        return ResponseEntity.ok(ApiResponse.success("Transactions fetched successfully",
-                statementService.getTransactionsPaged(id, email, type, category, pageable)));
+        return ResponseEntity.ok(ApiResponse.success(
+                "Transactions fetched successfully",
+                statementService.getAllTransactionsPaged(email, type, category, pageable)
+        ));
     }
 
+    @GetMapping("/weekly-spend")
+    public ResponseEntity<ApiResponse<List<WeeklySpendDto>>> getAllWeeklySpend(
+            Authentication authentication
+    ) {
+        String email = authentication.getName();
+        return ResponseEntity.ok(ApiResponse.success(
+                "Weekly spend fetched successfully",
+                statementService.getAllWeeklySpend(email)
+        ));
+    }
+
+    @GetMapping("/recurring")
+    public ResponseEntity<ApiResponse<List<RecurringChargeDto>>> getAllRecurringCharges(
+            Authentication authentication
+    ) {
+        String email = authentication.getName();
+        return ResponseEntity.ok(ApiResponse.success(
+                "Recurring charges fetched successfully",
+                statementService.getAllRecurringCharges(email)
+        ));
+    }
+
+    @GetMapping("/statements")
+    public ResponseEntity<ApiResponse<List<StatementDetailDto>>> getAll(
+            Authentication authentication
+    ) {
+        String email = authentication.getName();
+        return ResponseEntity.ok(ApiResponse.success(
+                "Statements fetched successfully",
+                statementService.getAllForUser(email)
+        ));
+    }
+
+    @GetMapping("/statements/ids")
+    public ResponseEntity<ApiResponse<List<StatementIdWithBankDto>>> getStatementIds(
+            Authentication authentication
+    ) {
+        String email = authentication.getName();
+        return ResponseEntity.ok(ApiResponse.success(
+                "Statement IDs fetched successfully",
+                statementService.getIdsWithBankForUser(email)
+        ));
+    }
+
+    @GetMapping("/statements/{id}")
+    public ResponseEntity<ApiResponse<StatementDetailDto>> getOne(
+            @PathVariable java.util.UUID id,
+            Authentication authentication
+    ) {
+        String email = authentication.getName();
+        return ResponseEntity.ok(ApiResponse.success(
+                "Statement fetched successfully",
+                statementService.getOneForUser(id, email)
+        ));
+    }
 }
