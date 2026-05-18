@@ -279,37 +279,131 @@ public class AIContextBuilderService {
             RiskProfile risk,
             List<BehavioralSignal> signals
     ) {
+
         int score = 100;
 
-        // Hard risk flags
-        if (risk.overspending())     score -= 25;
-        if (risk.noSavings())        score -= 20;
-        if (risk.highEmiPressure())  score -= 10;
-        if (!risk.spendingSpikes().isEmpty()) score -= 5;
+        // =========================================
+        // CORE FINANCIAL HEALTH (MOST IMPORTANT)
+        // =========================================
 
-        // Signal-based deductions (fired HIGH signals each cost 10, MEDIUM cost 5)
+        if (risk.overspending()) {
+            score -= 12;
+        }
+
+        if (risk.noSavings()) {
+            score -= 10;
+        }
+
+        if (risk.highEmiPressure()) {
+            score -= 8;
+        }
+
+        if (!risk.spendingSpikes().isEmpty()) {
+            score -= 4;
+        }
+
+        // =========================================
+        // BEHAVIORAL SIGNAL IMPACT
+        // Softer deductions.
+        // Signals influence score,
+        // they don't destroy it.
+        // =========================================
+
         for (BehavioralSignal signal : signals) {
-            if (!signal.isFired()) continue;
-            // Positive signals add back points
+
+            if (!signal.isFired()) {
+                continue;
+            }
+
             switch (signal.getSignalType()) {
-                case HEALTHY_SAVINGS     -> score += 5;
-                case INVESTING_HABIT     -> score += 5;
-                case CONTROLLED_SPENDING -> score += 5;
-                // Negative signals deduct
-                case OVERSPENDING        -> {} // already counted via risk.overspending()
-                case ZERO_SAVINGS        -> {} // already counted via risk.noSavings()
-                case HIGH_EMI_BURDEN     -> {} // already counted via risk.highEmiPressure()
-                default -> score -= signal.getSeverity() == BehavioralSignal.Severity.HIGH ? 10 : 5;
+
+                // ================================
+                // POSITIVE SIGNALS
+                // ================================
+
+                case HEALTHY_SAVINGS -> score += 5;
+
+                case INVESTING_HABIT -> score += 4;
+
+                case CONTROLLED_SPENDING -> score += 3;
+
+                // ================================
+                // ALREADY ACCOUNTED RISKS
+                // Avoid double-penalizing
+                // ================================
+
+                case OVERSPENDING -> {
+                }
+
+                case ZERO_SAVINGS -> {
+                }
+
+                case HIGH_EMI_BURDEN -> {
+                }
+
+                // ================================
+                // OTHER NEGATIVE SIGNALS
+                // ================================
+
+                default -> {
+
+                    switch (signal.getSeverity()) {
+
+                        case HIGH -> score -= 3;
+
+                        case MEDIUM -> score -= 2;
+
+                        case LOW -> score -= 1;
+                    }
+                }
             }
         }
 
-        score = Math.max(0, Math.min(100, score));
+        // =========================================
+        // SCORE NORMALIZATION
+        // Avoid absurd/extreme outputs
+        // =========================================
 
-        String grade = score >= 80 ? "A" : score >= 65 ? "B" : score >= 50 ? "C" : score >= 35 ? "D" : "F";
-        String label = score >= 80 ? "Healthy" : score >= 65 ? "Fair"
-                : score >= 50 ? "Needs Attention" : "At Risk";
+        score = Math.max(30, Math.min(100, score));
 
-        return new HealthScore(score, grade, label);
+        // =========================================
+        // GRADE MAPPING
+        // =========================================
+
+        String grade;
+        String label;
+
+        if (score >= 85) {
+
+            grade = "A";
+            label = "Excellent";
+
+        } else if (score >= 70) {
+
+            grade = "B";
+            label = "Healthy";
+
+        } else if (score >= 55) {
+
+            grade = "C";
+            label = "Moderate";
+
+        } else if (score >= 40) {
+
+            grade = "D";
+            label = "Needs Attention";
+
+        } else {
+
+            grade = "F";
+            label = "At Risk";
+        }
+
+        return new HealthScore(
+                score,
+                grade,
+                label
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────

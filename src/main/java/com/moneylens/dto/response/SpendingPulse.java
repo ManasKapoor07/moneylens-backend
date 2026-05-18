@@ -6,9 +6,6 @@ public record SpendingPulse(
         String status,
 
         // Single punchy sentence — the vibe of their cash flow
-        // "Your money moves in bursts, not streams."
-        String summary,
+        String summary
 
-        // Honest 0–100 score. Not flattering.
-        int stabilityScore
 ) {}

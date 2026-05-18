@@ -50,9 +50,9 @@ public class SecurityConfig {
     private String frontendUrl;
 
     private static final String[] PUBLIC_URLS = {
-            "/api/v1/auth/**",
+            "/api/v1/auth/login",
+            "/api/v1/auth/register",
             "/h2-console/**",
-            "/api/v1/statements/**",
             "/actuator/health",
             "/swagger-ui/**",
             "/v3/api-docs/**"

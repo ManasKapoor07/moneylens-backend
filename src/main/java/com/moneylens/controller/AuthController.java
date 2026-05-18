@@ -4,6 +4,7 @@ import com.moneylens.dto.request.*;
 import com.moneylens.dto.response.ApiResponse;
 import com.moneylens.dto.response.AuthResponse;
 import com.moneylens.entity.User;
+import org.springframework.security.core.Authentication;
 import com.moneylens.exception.UserNotFoundException;
 import com.moneylens.repository.UserRepository;
 import com.moneylens.service.AuthService;
@@ -135,9 +136,14 @@ public class AuthController {
      */
     @GetMapping("/me")
     public ResponseEntity<ApiResponse<AuthResponse.UserInfo>> me(
-            @AuthenticationPrincipal UserDetails userDetails) {
-        User user = userRepository.findByEmail(userDetails.getUsername())
-                .orElseThrow(() -> new UserNotFoundException("User not found"));
+            Authentication authentication
+    ) {
+
+        String userEmail = authentication.getName();
+
+        User user = userRepository.findByEmail(userEmail)
+                .orElseThrow(() ->
+                        new UserNotFoundException("User not found"));
 
         AuthResponse.UserInfo userInfo = AuthResponse.UserInfo.builder()
                 .id(user.getId())
@@ -148,6 +154,8 @@ public class AuthController {
                 .hasStatement(user.getHasStatement())
                 .build();
 
-        return ResponseEntity.ok(ApiResponse.success("User profile fetched", userInfo));
+        return ResponseEntity.ok(
+                ApiResponse.success("User profile fetched", userInfo)
+        );
     }
 }

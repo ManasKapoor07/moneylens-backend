@@ -12,6 +12,8 @@ import org.springframework.stereotype.Service;
 
 import java.time.LocalDateTime;
 import java.util.UUID;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 @Service
 public class FinancialAIAnalysisService {
@@ -231,6 +233,47 @@ PROFILE:
      * @param contextJson the rendered prompt context from AIContextBuilderService
      * @return parsed AIAnalysisResponse
      */
+    private AIContextBuilderService.HealthScore extractHealthScore(
+            String contextJson
+    ) {
+
+        try {
+
+            // Example line:
+            // Score: 42/100 (D — At Risk)
+
+            Pattern pattern = Pattern.compile(
+                    "Score:\\s*(\\d+)/100\\s*\\((.*?)\\s*—\\s*(.*?)\\)"
+            );
+
+            Matcher matcher = pattern.matcher(contextJson);
+
+            if (matcher.find()) {
+
+                int score = Integer.parseInt(
+                        matcher.group(1)
+                );
+
+                String grade = matcher.group(2).trim();
+
+                String label = matcher.group(3).trim();
+
+                return new AIContextBuilderService.HealthScore(
+                        score,
+                        grade,
+                        label
+                );
+            }
+
+        } catch (Exception ignored) {}
+
+        return new AIContextBuilderService.HealthScore(
+                50,
+                "C",
+                "Needs Attention"
+        );
+    }
+
     public AIAnalysisResponse analyzeFromContext(String contextJson) {
         try {
             String prompt = ANALYSIS_PROMPT_TEMPLATE.replace("{{CONTEXT}}", contextJson);
@@ -242,7 +285,18 @@ PROFILE:
                     .replace("```", "")
                     .trim();
 
-            return objectMapper.readValue(cleaned, AIAnalysisResponse.class);
+            AIAnalysisResponse response =
+                    objectMapper.readValue(
+                            cleaned,
+                            AIAnalysisResponse.class
+                    );
+
+// inject deterministic backend score
+            response.setHealthScore(
+                    extractHealthScore(contextJson)
+            );
+
+            return response;
 
         } catch (Exception e) {
             throw new RuntimeException("AI analysis from context failed", e);

@@ -1,5 +1,7 @@
 package com.moneylens.dto.response;
 
+import com.moneylens.service.AIContextBuilderService;
+
 import java.util.List;
 
 public class AIAnalysisResponse {
@@ -24,6 +26,7 @@ public class AIAnalysisResponse {
     // =============================================
 
     private SpendingPulse spendingPulse;
+    private AIContextBuilderService.HealthScore healthScore;
 
     // =============================================
     // RISKS
@@ -84,6 +87,15 @@ public class AIAnalysisResponse {
 
     public void setSummary(String summary) {
         this.summary = summary;
+    }
+    public AIContextBuilderService.HealthScore getHealthScore() {
+        return healthScore;
+    }
+
+    public void setHealthScore(
+            AIContextBuilderService.HealthScore healthScore
+    ) {
+        this.healthScore = healthScore;
     }
 
     public MoneyPersonality getMoneyPersonality() {
