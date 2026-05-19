@@ -112,6 +112,8 @@ public class SecurityConfig {
         configuration.setAllowedOrigins(Arrays.asList(
                 frontendUrl,
                 "http://localhost:3000",
+                "https://moneylens.club",
+                "https://www.moneylens.club",
                 "http://localhost:5173"
         ));
 
