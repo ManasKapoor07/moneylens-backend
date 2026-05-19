@@ -29,6 +29,17 @@ public class GlobalExceptionHandler {
                 .body(ApiResponse.error(e.getMessage()));
     }
 
+    @ExceptionHandler(DailyLimitExceededException.class)
+    public ResponseEntity<Map<String, Object>> handleDailyLimitExceeded(
+            DailyLimitExceededException ex
+    ) {
+        return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).body(Map.of(
+                "error", "DAILY_LIMIT_EXCEEDED",
+                "message", ex.getMessage(),
+                "premium", false
+        ));
+    }
+
     @ExceptionHandler(InvalidCredentialsException.class)
     public ResponseEntity<ApiResponse<Void>> handleInvalidCredentials(
             InvalidCredentialsException e) {
