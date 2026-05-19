@@ -1,117 +1,133 @@
 package com.moneylens.controller;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.moneylens.dto.response.AIAnalysisResponse;
 import com.moneylens.entity.User;
 import com.moneylens.entity.UserFinancialProfile;
 import com.moneylens.repository.UserFinancialProfileRepository;
 import com.moneylens.repository.UserRepository;
-import com.moneylens.service.FinancialAIAnalysisService;
 import com.moneylens.service.UserProfileAggregatorService;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.*;
+import org.springframework.web.server.ResponseStatusException;
 
-import java.util.UUID;
+import java.util.Map;
 
-/**
- * REST controller for AI-powered financial analysis.
- *
- * Endpoints:
- *   GET  /api/ai/analysis               — Get (or generate) the merged user-level analysis
- *   POST /api/ai/analysis/refresh       — Force-rebuild the user profile + re-run AI
- *   GET  /api/ai/analysis/{statementId} — Per-statement drill-down analysis
- */
 @RestController
 @RequestMapping("/api/v1/ai")
 public class AIAnalysisController {
 
-    private final FinancialAIAnalysisService     aiAnalysisService;
-    private final UserFinancialProfileRepository userFinancialProfileRepository;
-    private final UserProfileAggregatorService   userProfileAggregatorService;
+    private static final Logger log = LoggerFactory.getLogger(AIAnalysisController.class);
+
     private final UserRepository                 userRepository;
+    private final UserFinancialProfileRepository financialProfileRepository;
+    private final UserProfileAggregatorService   aggregatorService;
     private final ObjectMapper                   objectMapper;
 
     public AIAnalysisController(
-            FinancialAIAnalysisService aiAnalysisService,
-            UserFinancialProfileRepository userFinancialProfileRepository,
-            UserProfileAggregatorService userProfileAggregatorService,
             UserRepository userRepository,
+            UserFinancialProfileRepository financialProfileRepository,
+            UserProfileAggregatorService aggregatorService,
             ObjectMapper objectMapper
     ) {
-        this.aiAnalysisService             = aiAnalysisService;
-        this.userFinancialProfileRepository = userFinancialProfileRepository;
-        this.userProfileAggregatorService  = userProfileAggregatorService;
-        this.userRepository                = userRepository;
-        this.objectMapper                  = objectMapper;
+        this.userRepository            = userRepository;
+        this.financialProfileRepository = financialProfileRepository;
+        this.aggregatorService         = aggregatorService;
+        this.objectMapper              = objectMapper;
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // GET /api/ai/analysis
-    //
-    // Serves cached analysisJson from UserFinancialProfile if available.
-    // Falls back to a synchronous recompute if no profile exists yet.
-    // Returns 204 if the user has no completed statements at all.
-    // ─────────────────────────────────────────────────────────────────────────
+    /**
+     * GET /api/v1/ai/analysis
+     *
+     * Returns the stored analysisJson plus a top-level `isStale` flag.
+     * Frontend uses isStale to show a soft "Your insights may be outdated — Refresh" nudge.
+     *
+     * Response shape:
+     * {
+     *   "isStale": true,
+     *   "analysis": { ...AIAnalysisResponse fields... }
+     * }
+     */
     @GetMapping("/analysis")
-    public ResponseEntity<AIAnalysisResponse> getUserAnalysis(Authentication authentication) {
-        String email = authentication.getName();
-        User user = userRepository.findByEmail(email)
-                .orElseThrow(() -> new RuntimeException("User not found"));
-        UUID userId = user.getId();
+    public ResponseEntity<Map<String, Object>> getAnalysis(Authentication authentication) {
+        User user = resolveUser(authentication.getName());
 
-        UserFinancialProfile profile = userFinancialProfileRepository
-                .findByUserId(userId)
-                .orElse(null);
+        UserFinancialProfile profile = financialProfileRepository.findByUser(user)
+                .orElseThrow(() -> new ResponseStatusException(
+                        HttpStatus.NOT_FOUND, "No analysis available yet — upload a statement first"));
 
-        if (profile != null && profile.getAnalysisJson() != null) {
-            return ResponseEntity.ok(parseAnalysis(profile.getAnalysisJson()));
+        if (profile.getAnalysisJson() == null) {
+            throw new ResponseStatusException(
+                    HttpStatus.NOT_FOUND, "Analysis not yet generated for this profile");
         }
 
-        UserFinancialProfile fresh = userProfileAggregatorService
-                .recompute(userId, UserProfileAggregatorService.REASON_MANUAL_REFRESH);
-
-        if (fresh == null || fresh.getAnalysisJson() == null) {
-            return ResponseEntity.noContent().build();
-        }
-
-        return ResponseEntity.ok(parseAnalysis(fresh.getAnalysisJson()));
-    }
-
-    @PostMapping("/analysis/refresh")
-    public ResponseEntity<AIAnalysisResponse> refreshAnalysis(Authentication authentication) {
-        String email = authentication.getName();
-        User user = userRepository.findByEmail(email)
-                .orElseThrow(() -> new RuntimeException("User not found"));
-
-        UserFinancialProfile fresh = userProfileAggregatorService
-                .recompute(user.getId(), UserProfileAggregatorService.REASON_MANUAL_REFRESH);
-
-        if (fresh == null || fresh.getAnalysisJson() == null) {
-            return ResponseEntity.noContent().build();
-        }
-
-        return ResponseEntity.ok(parseAnalysis(fresh.getAnalysisJson()));
-    }
-
-    @GetMapping("/analysis/{statementId}")
-    public ResponseEntity<AIAnalysisResponse> getStatementAnalysis(
-            @PathVariable UUID statementId,
-            Authentication authentication
-    ) {
-        AIAnalysisResponse analysis = aiAnalysisService.analyze(statementId);
-        return ResponseEntity.ok(analysis);
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // HELPER
-    // ─────────────────────────────────────────────────────────────────────────
-
-    private AIAnalysisResponse parseAnalysis(String analysisJson) {
         try {
-            return objectMapper.readValue(analysisJson, AIAnalysisResponse.class);
+            Object analysisObj = objectMapper.readValue(profile.getAnalysisJson(), Object.class);
+            return ResponseEntity.ok(Map.of(
+                    "isStale",  profile.isAnalysisStale(),
+                    "analysis", analysisObj
+            ));
         } catch (Exception e) {
-            throw new RuntimeException("Failed to parse cached analysis JSON", e);
+            log.error("Failed to deserialize analysisJson for user: {}", user.getId(), e);
+            throw new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR, "Analysis data corrupted");
         }
+    }
+
+    /**
+     * POST /api/v1/ai/analysis/refresh
+     *
+     * Triggers a synchronous rebuild of the user's aggregated profile.
+     * Clears the stale flag on completion (handled inside recordRebuild()).
+     *
+     * Only does work if the profile is actually stale — idempotent if already fresh.
+     */
+    @PostMapping("/analysis/refresh")
+    public ResponseEntity<Map<String, Object>> refreshAnalysis(Authentication authentication) {
+        User user = resolveUser(authentication.getName());
+
+        UserFinancialProfile profile = financialProfileRepository.findByUser(user).orElse(null);
+
+        if (profile != null && !profile.isAnalysisStale()) {
+            // Already fresh — return current analysis without recomputing
+            log.info("Analysis refresh requested but already fresh for user: {}", user.getId());
+            try {
+                Object analysisObj = objectMapper.readValue(profile.getAnalysisJson(), Object.class);
+                return ResponseEntity.ok(Map.of(
+                        "isStale",  false,
+                        "analysis", analysisObj
+                ));
+            } catch (Exception e) {
+                throw new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR, "Analysis data corrupted");
+            }
+        }
+
+        // Stale — rebuild synchronously so response contains fresh data
+        log.info("Rebuilding stale analysis for user: {}", user.getId());
+        aggregatorService.recompute(user.getId(), "MANUAL_REFRESH");
+
+        // Reload after rebuild
+        UserFinancialProfile refreshed = financialProfileRepository.findByUser(user)
+                .orElseThrow(() -> new ResponseStatusException(
+                        HttpStatus.INTERNAL_SERVER_ERROR, "Profile missing after rebuild"));
+
+        try {
+            Object analysisObj = objectMapper.readValue(refreshed.getAnalysisJson(), Object.class);
+            return ResponseEntity.ok(Map.of(
+                    "isStale",  refreshed.isAnalysisStale(), // should be false after rebuild
+                    "analysis", analysisObj
+            ));
+        } catch (Exception e) {
+            throw new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR, "Analysis data corrupted");
+        }
+    }
+
+    // ── Helper ────────────────────────────────────────────────────────────────
+
+    private User resolveUser(String email) {
+        return userRepository.findByEmail(email)
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "User not found"));
     }
 }

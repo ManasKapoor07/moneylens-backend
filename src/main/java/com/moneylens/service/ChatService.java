@@ -922,6 +922,8 @@ public class ChatService {
                 .append(goalName).append("** — I've generated the first ")
                 .append(displayCount).append(" ").append(periodPlural)
                 .append(" to start. Complete each chunk and I'll unlock the next set with updated actions.\n\n");
+        sb.append("📌 Your full plan and progress are available on the **Goals** page.");
+
         sb.append(plan.summary).append("\n\n");
 
         if (plan.weeks != null) {
@@ -952,6 +954,7 @@ public class ChatService {
     private String buildGoalConfirmedOfferMessage(UserGoal goal) {
         return String.format(
                 "✅ Goal created: **%s**%s%s\n\n" +
+                        "You can track it anytime on the **Goals** page.\n\n" +
                         "Would you like me to build a **weekly** or **monthly** savings plan for this goal? " +
                         "I'll give you a concrete roadmap based on your actual spending behavior — " +
                         "3 periods at a time so you get focused, achievable actions.",

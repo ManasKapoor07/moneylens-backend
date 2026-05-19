@@ -18,35 +18,20 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
-/**
- * CHANGES FROM ORIGINAL:
- *   - Injects BehavioralSignalEngine
- *   - Step 2.5 added between insights and AI context:
- *       computeForStatement() → List<BehavioralSignal>
- *   - buildContext() now receives signals
- *
- * Pipeline order:
- *   1. Transaction extraction
- *   2. Insights (TransactionInsight)
- *   2.5 Behavioral signals (BehavioralSignal) ← NEW
- *   3. AI context (includes signals)
- *   4. Persist financial profile
- *   5. Mark COMPLETED
- *   6. Trigger user profile rebuild
- */
 @Service
 public class TransactionExtractionWorker {
 
     private static final Logger log = LoggerFactory.getLogger(TransactionExtractionWorker.class);
 
-    private final StatementRepository              statementRepository;
-    private final TransactionRepository            transactionRepository;
-    private final TransactionInsightRepository     insightRepository;
-    private final TransactionMapper                mapper;
-    private final AIContextBuilderService          aiContextBuilder;
-    private final BehavioralSignalEngine           signalEngine;          // NEW
+    private final StatementRepository                statementRepository;
+    private final TransactionRepository              transactionRepository;
+    private final TransactionInsightRepository       insightRepository;
+    private final TransactionMapper                  mapper;
+    private final AIContextBuilderService            aiContextBuilder;
+    private final BehavioralSignalEngine             signalEngine;
     private final FinancialProfilePersistenceService financialProfilePersistenceService;
-    private final UserProfileAggregatorService     userProfileAggregatorService;
+    private final UserProfileAggregatorService       userProfileAggregatorService;
+    private final ClarificationGeneratorService      clarificationGeneratorService; // NEW
 
     public TransactionExtractionWorker(
             StatementRepository statementRepository,
@@ -56,7 +41,8 @@ public class TransactionExtractionWorker {
             AIContextBuilderService aiContextBuilder,
             BehavioralSignalEngine signalEngine,
             FinancialProfilePersistenceService financialProfilePersistenceService,
-            UserProfileAggregatorService userProfileAggregatorService
+            UserProfileAggregatorService userProfileAggregatorService,
+            ClarificationGeneratorService clarificationGeneratorService
     ) {
         this.statementRepository             = statementRepository;
         this.transactionRepository           = transactionRepository;
@@ -66,6 +52,7 @@ public class TransactionExtractionWorker {
         this.signalEngine                    = signalEngine;
         this.financialProfilePersistenceService = financialProfilePersistenceService;
         this.userProfileAggregatorService    = userProfileAggregatorService;
+        this.clarificationGeneratorService   = clarificationGeneratorService;
     }
 
     @Transactional
@@ -149,6 +136,14 @@ public class TransactionExtractionWorker {
                 log.info("User profile rebuilt for user: {}", userId);
             } catch (Exception e) {
                 log.warn("Profile rebuild failed after upload — will retry on next startup", e);
+            }
+
+            // ── STEP 7: Generate clarification cards ──────────────────────────
+            // Runs last — non-blocking, failure here must NOT affect statement status
+            try {
+                clarificationGeneratorService.generateForStatement(statementId, userId, transactions);
+            } catch (Exception e) {
+                log.warn("Clarification generation failed for statement: {} — non-fatal", statementId, e);
             }
 
         } catch (Exception e) {

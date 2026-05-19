@@ -1,8 +1,13 @@
 package com.moneylens.service;
 
 import com.moneylens.entity.BehavioralSignal;
+import com.moneylens.entity.TransactionClarification;
 import com.moneylens.entity.Transaction;
 import com.moneylens.entity.TransactionInsight;
+import com.moneylens.entity.UserOnboardingProfile;
+import com.moneylens.repository.TransactionClarificationRepository;
+import com.moneylens.repository.UserOnboardingProfileRepository;
+import com.moneylens.repository.UserRepository;
 import com.moneylens.signal.engine.SignalResult;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -18,39 +23,41 @@ import java.util.stream.Collectors;
 /**
  * AIContextBuilderService
  *
- * CHANGES FROM ORIGINAL:
- *   - buildContext() now accepts List<BehavioralSignal> (replaces the raw
- *     pattern strings it used to compute itself)
- *   - buildPromptContext() accepts the same
- *   - renderPromptContext() now has a BEHAVIORAL SIGNALS section that feeds
- *     the LLM pre-computed, evidence-backed facts instead of asking it to
- *     infer patterns from raw numbers
- *   - normalizeMerchant() delegates to MerchantRegistry
- *   - MERCHANT_ALIAS static map removed
- *   - BehaviorProfile.patterns list removed (replaced by signals)
- *
- * The health score is still computed deterministically here and should be
- * read from context.healthScore().score() — NOT from GPT's spendingPulse.
+ * CHANGES FROM PREVIOUS VERSION:
+ *   - Injects UserOnboardingProfileRepository + TransactionClarificationRepository
+ *   - renderPromptContext() now accepts optional userId so it can load:
+ *       (a) UserOnboardingProfile  → "USER CONTEXT" section
+ *       (b) Resolved clarifications → "RESOLVED CLARIFICATIONS" section
+ *   - Both sections are injected at the TOP of the prompt so GPT treats them
+ *     as ground truth before seeing any inferred numbers
+ *   - Old renderPromptContext(AIContext) still works (no userId = no extra sections)
  */
 @Service
 public class AIContextBuilderService {
 
     private static final Logger log = LoggerFactory.getLogger(AIContextBuilderService.class);
 
-    private final MerchantRegistry merchantRegistry;
+    private final MerchantRegistry                   merchantRegistry;
+    private final UserRepository                     userRepository;
+    private final UserOnboardingProfileRepository    onboardingRepository;
+    private final TransactionClarificationRepository clarificationRepository;
 
-    public AIContextBuilderService(MerchantRegistry merchantRegistry) {
-        this.merchantRegistry = merchantRegistry;
+    public AIContextBuilderService(
+            MerchantRegistry merchantRegistry,
+            UserRepository userRepository,
+            UserOnboardingProfileRepository onboardingRepository,
+            TransactionClarificationRepository clarificationRepository
+    ) {
+        this.merchantRegistry        = merchantRegistry;
+        this.userRepository          = userRepository;
+        this.onboardingRepository    = onboardingRepository;
+        this.clarificationRepository = clarificationRepository;
     }
 
     // ─────────────────────────────────────────────────────────────────
     // PUBLIC API
     // ─────────────────────────────────────────────────────────────────
 
-    /**
-     * Build AIContext from transactions + pre-computed signals.
-     * Signals come from BehavioralSignalEngine — never computed here.
-     */
     public AIContext buildContext(
             List<Transaction> transactions,
             List<TransactionInsight> insights,
@@ -59,11 +66,11 @@ public class AIContextBuilderService {
         List<Transaction> debits  = filter(transactions, Transaction.Type.DEBIT);
         List<Transaction> credits = filter(transactions, Transaction.Type.CREDIT);
 
-        IncomeProfile   income   = buildIncomeProfile(credits);
-        ExpenseProfile  expenses = buildExpenseProfile(debits);
+        IncomeProfile   income    = buildIncomeProfile(credits);
+        ExpenseProfile  expenses  = buildExpenseProfile(debits);
         MerchantProfile merchants = buildMerchantProfile(debits);
-        RiskProfile     risk     = buildRiskProfile(debits, credits, expenses);
-        HealthScore     health   = computeHealthScore(expenses, risk, signals);
+        RiskProfile     risk      = buildRiskProfile(debits, credits, expenses);
+        HealthScore     health    = computeHealthScore(expenses, risk, signals);
 
         return AIContext.builder()
                 .periodLabel(resolvePeriodLabel(transactions))
@@ -76,24 +83,22 @@ public class AIContextBuilderService {
                 .build();
     }
 
-    /**
-     * Convenience overload — no signals (backward compat for callers that
-     * haven't wired the engine yet).
-     */
     public AIContext buildContext(List<Transaction> transactions, List<TransactionInsight> insights) {
         return buildContext(transactions, insights, List.of());
     }
 
     /**
-     * Build context and render to prompt string in one call.
+     * Build context and render to prompt string — WITH user context injected.
+     * This is the preferred overload when a userId is available.
      */
     public String buildPromptContext(
             List<Transaction> transactions,
             List<TransactionInsight> insights,
-            List<BehavioralSignal> signals
+            List<BehavioralSignal> signals,
+            UUID userId
     ) {
         AIContext ctx = buildContext(transactions, insights, signals);
-        String prompt = renderPromptContext(ctx);
+        String prompt = renderPromptContext(ctx, userId);
         log.info("AIContext built — period: {} | health: {}/100 ({}) | signals: {} fired",
                 ctx.periodLabel(),
                 ctx.healthScore().score(),
@@ -102,12 +107,180 @@ public class AIContextBuilderService {
         return prompt;
     }
 
+    public String buildPromptContext(
+            List<Transaction> transactions,
+            List<TransactionInsight> insights,
+            List<BehavioralSignal> signals
+    ) {
+        return buildPromptContext(transactions, insights, signals, null);
+    }
+
     public String buildPromptContext(List<Transaction> transactions, List<TransactionInsight> insights) {
-        return buildPromptContext(transactions, insights, List.of());
+        return buildPromptContext(transactions, insights, List.of(), null);
     }
 
     // ─────────────────────────────────────────────────────────────────
-    // INCOME PROFILE  (unchanged from original)
+    // PROMPT RENDERER — core change is here
+    // ─────────────────────────────────────────────────────────────────
+
+    /**
+     * Render AIContext to a prompt string.
+     * If userId is provided, prepends USER CONTEXT + RESOLVED CLARIFICATIONS sections.
+     */
+    public String renderPromptContext(AIContext ctx, UUID userId) {
+        StringBuilder sb = new StringBuilder();
+
+        // ── USER CONTEXT (ground truth — rendered FIRST) ─────────────────────
+        if (userId != null) {
+            appendUserContext(sb, userId);
+        }
+
+        sb.append("=== FINANCIAL PROFILE: ").append(ctx.periodLabel()).append(" ===\n\n");
+
+        // ── Income ────────────────────────────────────────────────────────────
+        sb.append("INCOME\n");
+        sb.append("  Total received: ₹").append(fmt(ctx.income().totalCredit())).append("\n");
+        if (ctx.income().salaryDetected()) {
+            sb.append("  Salary: ₹").append(fmt(ctx.income().salaryAmount()))
+                    .append(" on ").append(ctx.income().salaryDate());
+            if (ctx.income().employer() != null) sb.append(" from ").append(ctx.income().employer());
+            sb.append("\n");
+        }
+        if (ctx.income().secondaryIncome().compareTo(BigDecimal.ZERO) > 0) {
+            sb.append("  Other income: ₹").append(fmt(ctx.income().secondaryIncome())).append("\n");
+        }
+        sb.append("\n");
+
+        // ── Expenses ──────────────────────────────────────────────────────────
+        sb.append("EXPENSES\n");
+        sb.append("  Total spent: ₹").append(fmt(ctx.expenses().totalDebit())).append("\n");
+        sb.append("  Average daily spend: ₹").append(fmt(ctx.expenses().avgDaily())).append("\n");
+        if (ctx.expenses().emiTotal().compareTo(BigDecimal.ZERO) > 0) {
+            sb.append("  EMI/Loan payments: ₹").append(fmt(ctx.expenses().emiTotal())).append("\n");
+        }
+        sb.append("  Breakdown by category:\n");
+        ctx.expenses().breakdown().stream()
+                .filter(c -> c.amount().compareTo(BigDecimal.valueOf(100)) > 0)
+                .forEach(c -> sb.append("    - ").append(c.category())
+                        .append(": ₹").append(fmt(c.amount()))
+                        .append(" (").append(c.percentOfTotal()).append("%)\n"));
+        sb.append("\n");
+
+        // ── Top merchants ─────────────────────────────────────────────────────
+        sb.append("TOP MERCHANTS\n");
+        ctx.merchants().top().stream().limit(7).forEach(m ->
+                sb.append("  - ").append(m.name())
+                        .append(": ₹").append(fmt(m.totalSpent()))
+                        .append(" · ").append(m.transactionCount()).append("x\n"));
+        if (!ctx.merchants().recurring().isEmpty()) {
+            sb.append("  Recurring: ")
+                    .append(String.join(", ", ctx.merchants().recurring())).append("\n");
+        }
+        sb.append("\n");
+
+        // ── Behavioral signals ────────────────────────────────────────────────
+        List<BehavioralSignal> firedSignals = ctx.signals().stream()
+                .filter(BehavioralSignal::isFired)
+                .sorted(Comparator.comparing(BehavioralSignal::getSeverity).reversed())
+                .collect(Collectors.toList());
+
+        if (!firedSignals.isEmpty()) {
+            sb.append("BEHAVIORAL SIGNALS (pre-computed — narrate these, do not add others)\n");
+            for (BehavioralSignal signal : firedSignals) {
+                sb.append("  [").append(signal.getSeverity()).append("] ")
+                        .append(signal.getSignalType().name()).append("\n");
+                if (signal.getEvidence() != null) {
+                    sb.append("    Evidence: ").append(signal.getEvidence()).append("\n");
+                }
+            }
+            sb.append("\n");
+        } else {
+            sb.append("BEHAVIORAL SIGNALS\n  No significant signals detected.\n\n");
+        }
+
+        // ── Financial health ──────────────────────────────────────────────────
+        sb.append("FINANCIAL HEALTH\n");
+        sb.append("  Score: ").append(ctx.healthScore().score())
+                .append("/100 (").append(ctx.healthScore().grade())
+                .append(" — ").append(ctx.healthScore().label()).append(")\n");
+        sb.append("  Burn rate: ").append(ctx.risk().burnRatePct()).append("% of income spent\n");
+        sb.append("  Savings rate: ").append(ctx.risk().savingsRate()).append("%\n");
+        if (!ctx.risk().spendingSpikes().isEmpty()) {
+            sb.append("  Spending spikes: ")
+                    .append(String.join(", ", ctx.risk().spendingSpikes())).append("\n");
+        }
+
+        List<String> flags = new ArrayList<>();
+        if (ctx.risk().overspending())    flags.add("overspending");
+        if (ctx.risk().noSavings())       flags.add("zero savings");
+        if (ctx.risk().highEmiPressure()) flags.add("high EMI burden");
+        sb.append("  Flags: ").append(flags.isEmpty() ? "none" : String.join(", ", flags))
+                .append("\n");
+
+        return sb.toString();
+    }
+
+    /** Backward-compat overload — no userId, no user context sections. */
+    public String renderPromptContext(AIContext ctx) {
+        return renderPromptContext(ctx, null);
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // USER CONTEXT INJECTION
+    // ─────────────────────────────────────────────────────────────────
+
+    private void appendUserContext(StringBuilder sb, UUID userId) {
+
+        // ── Onboarding profile ────────────────────────────────────────────────
+        userRepository.findById(userId).ifPresent(user -> {
+            onboardingRepository.findByUser(user).ifPresent(profile -> {
+                if (profile.isSkipped()) return; // user skipped — don't add empty section
+
+                sb.append("USER CONTEXT (provided by user — treat as ground truth, override inferences)\n");
+
+                if (profile.getPrimaryGoal() != null) {
+                    sb.append("  Financial goal: ")
+                            .append(humanize(profile.getPrimaryGoal().name())).append("\n");
+                }
+                if (profile.getEmploymentType() != null) {
+                    sb.append("  Employment: ")
+                            .append(humanize(profile.getEmploymentType().name())).append("\n");
+                }
+                if (profile.getDependents() != null) {
+                    sb.append("  Dependents: ")
+                            .append(humanize(profile.getDependents().name())).append("\n");
+                }
+                if (profile.getCityTier() != null) {
+                    sb.append("  City tier: ")
+                            .append(humanize(profile.getCityTier().name())).append("\n");
+                }
+                if (profile.getIncomeRange() != null) {
+                    sb.append("  Stated income range: ")
+                            .append(incomeRangeLabel(profile.getIncomeRange())).append("\n");
+                }
+                sb.append("\n");
+            });
+        });
+
+        // ── Resolved clarifications ───────────────────────────────────────────
+        userRepository.findById(userId).ifPresent(user -> {
+            List<TransactionClarification> resolved = clarificationRepository
+                    .findByUserAndStatusOrderByCreatedAtAsc(
+                            user, TransactionClarification.Status.RESOLVED);
+
+            if (!resolved.isEmpty()) {
+                sb.append("RESOLVED CLARIFICATIONS (user-confirmed facts — use these, do not contradict)\n");
+                for (TransactionClarification c : resolved) {
+                    sb.append("  - ").append(c.getQuestionText())
+                            .append(" → ").append(c.getSelectedAnswer()).append("\n");
+                }
+                sb.append("\n");
+            }
+        });
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // INCOME PROFILE
     // ─────────────────────────────────────────────────────────────────
 
     private IncomeProfile buildIncomeProfile(List<Transaction> credits) {
@@ -145,7 +318,7 @@ public class AIContextBuilderService {
     }
 
     // ─────────────────────────────────────────────────────────────────
-    // EXPENSE PROFILE  (unchanged)
+    // EXPENSE PROFILE
     // ─────────────────────────────────────────────────────────────────
 
     private ExpenseProfile buildExpenseProfile(List<Transaction> debits) {
@@ -184,7 +357,7 @@ public class AIContextBuilderService {
     }
 
     // ─────────────────────────────────────────────────────────────────
-    // MERCHANT PROFILE  (unchanged, normalizeMerchant now uses registry)
+    // MERCHANT PROFILE
     // ─────────────────────────────────────────────────────────────────
 
     private MerchantProfile buildMerchantProfile(List<Transaction> debits) {
@@ -216,7 +389,7 @@ public class AIContextBuilderService {
     }
 
     // ─────────────────────────────────────────────────────────────────
-    // RISK PROFILE  (simplified — behavior patterns removed, signals own them)
+    // RISK PROFILE
     // ─────────────────────────────────────────────────────────────────
 
     private RiskProfile buildRiskProfile(
@@ -252,7 +425,6 @@ public class AIContextBuilderService {
         boolean highEmiPressure = emiBurdenPct > 30;
         boolean noSavings       = savingsRate == 0;
 
-        // Spending spikes: days > 2x daily average
         Map<LocalDate, BigDecimal> dailyDebit = debits.stream()
                 .collect(Collectors.groupingBy(Transaction::getDate,
                         Collectors.reducing(BigDecimal.ZERO, Transaction::getAmount, BigDecimal::add)));
@@ -271,7 +443,7 @@ public class AIContextBuilderService {
     }
 
     // ─────────────────────────────────────────────────────────────────
-    // HEALTH SCORE  — now uses signals for deductions (more accurate)
+    // HEALTH SCORE
     // ─────────────────────────────────────────────────────────────────
 
     private HealthScore computeHealthScore(
@@ -279,225 +451,40 @@ public class AIContextBuilderService {
             RiskProfile risk,
             List<BehavioralSignal> signals
     ) {
-
         int score = 100;
 
-        // =========================================
-        // CORE FINANCIAL HEALTH (MOST IMPORTANT)
-        // =========================================
-
-        if (risk.overspending()) {
-            score -= 12;
-        }
-
-        if (risk.noSavings()) {
-            score -= 10;
-        }
-
-        if (risk.highEmiPressure()) {
-            score -= 8;
-        }
-
-        if (!risk.spendingSpikes().isEmpty()) {
-            score -= 4;
-        }
-
-        // =========================================
-        // BEHAVIORAL SIGNAL IMPACT
-        // Softer deductions.
-        // Signals influence score,
-        // they don't destroy it.
-        // =========================================
+        if (risk.overspending())    score -= 12;
+        if (risk.noSavings())       score -= 10;
+        if (risk.highEmiPressure()) score -= 8;
+        if (!risk.spendingSpikes().isEmpty()) score -= 4;
 
         for (BehavioralSignal signal : signals) {
-
-            if (!signal.isFired()) {
-                continue;
-            }
-
+            if (!signal.isFired()) continue;
             switch (signal.getSignalType()) {
-
-                // ================================
-                // POSITIVE SIGNALS
-                // ================================
-
-                case HEALTHY_SAVINGS -> score += 5;
-
-                case INVESTING_HABIT -> score += 4;
-
-                case CONTROLLED_SPENDING -> score += 3;
-
-                // ================================
-                // ALREADY ACCOUNTED RISKS
-                // Avoid double-penalizing
-                // ================================
-
-                case OVERSPENDING -> {
-                }
-
-                case ZERO_SAVINGS -> {
-                }
-
-                case HIGH_EMI_BURDEN -> {
-                }
-
-                // ================================
-                // OTHER NEGATIVE SIGNALS
-                // ================================
-
+                case HEALTHY_SAVINGS      -> score += 5;
+                case INVESTING_HABIT      -> score += 4;
+                case CONTROLLED_SPENDING  -> score += 3;
+                case OVERSPENDING, ZERO_SAVINGS, HIGH_EMI_BURDEN -> { /* already counted */ }
                 default -> {
-
                     switch (signal.getSeverity()) {
-
-                        case HIGH -> score -= 3;
-
+                        case HIGH   -> score -= 3;
                         case MEDIUM -> score -= 2;
-
-                        case LOW -> score -= 1;
+                        case LOW    -> score -= 1;
                     }
                 }
             }
         }
 
-        // =========================================
-        // SCORE NORMALIZATION
-        // Avoid absurd/extreme outputs
-        // =========================================
-
         score = Math.max(30, Math.min(100, score));
 
-        // =========================================
-        // GRADE MAPPING
-        // =========================================
+        String grade, label;
+        if      (score >= 85) { grade = "A"; label = "Excellent"; }
+        else if (score >= 70) { grade = "B"; label = "Healthy"; }
+        else if (score >= 55) { grade = "C"; label = "Moderate"; }
+        else if (score >= 40) { grade = "D"; label = "Needs Attention"; }
+        else                  { grade = "F"; label = "At Risk"; }
 
-        String grade;
-        String label;
-
-        if (score >= 85) {
-
-            grade = "A";
-            label = "Excellent";
-
-        } else if (score >= 70) {
-
-            grade = "B";
-            label = "Healthy";
-
-        } else if (score >= 55) {
-
-            grade = "C";
-            label = "Moderate";
-
-        } else if (score >= 40) {
-
-            grade = "D";
-            label = "Needs Attention";
-
-        } else {
-
-            grade = "F";
-            label = "At Risk";
-        }
-
-        return new HealthScore(
-                score,
-                grade,
-                label
-        );
-    }
-
-    // ─────────────────────────────────────────────────────────────────
-    // PROMPT RENDERER
-    // ─────────────────────────────────────────────────────────────────
-
-    public String renderPromptContext(AIContext ctx) {
-        StringBuilder sb = new StringBuilder();
-
-        sb.append("=== FINANCIAL PROFILE: ").append(ctx.periodLabel()).append(" ===\n\n");
-
-        // Income
-        sb.append("INCOME\n");
-        sb.append("  Total received: ₹").append(fmt(ctx.income().totalCredit())).append("\n");
-        if (ctx.income().salaryDetected()) {
-            sb.append("  Salary: ₹").append(fmt(ctx.income().salaryAmount()))
-                    .append(" on ").append(ctx.income().salaryDate());
-            if (ctx.income().employer() != null) sb.append(" from ").append(ctx.income().employer());
-            sb.append("\n");
-        }
-        if (ctx.income().secondaryIncome().compareTo(BigDecimal.ZERO) > 0) {
-            sb.append("  Other income: ₹").append(fmt(ctx.income().secondaryIncome())).append("\n");
-        }
-        sb.append("\n");
-
-        // Expenses
-        sb.append("EXPENSES\n");
-        sb.append("  Total spent: ₹").append(fmt(ctx.expenses().totalDebit())).append("\n");
-        sb.append("  Average daily spend: ₹").append(fmt(ctx.expenses().avgDaily())).append("\n");
-        if (ctx.expenses().emiTotal().compareTo(BigDecimal.ZERO) > 0) {
-            sb.append("  EMI/Loan payments: ₹").append(fmt(ctx.expenses().emiTotal())).append("\n");
-        }
-        sb.append("  Breakdown by category:\n");
-        ctx.expenses().breakdown().stream()
-                .filter(c -> c.amount().compareTo(BigDecimal.valueOf(100)) > 0)
-                .forEach(c -> sb.append("    - ").append(c.category())
-                        .append(": ₹").append(fmt(c.amount()))
-                        .append(" (").append(c.percentOfTotal()).append("%)\n"));
-        sb.append("\n");
-
-        // Top merchants
-        sb.append("TOP MERCHANTS\n");
-        ctx.merchants().top().stream().limit(7).forEach(m ->
-                sb.append("  - ").append(m.name())
-                        .append(": ₹").append(fmt(m.totalSpent()))
-                        .append(" · ").append(m.transactionCount()).append("x\n"));
-        if (!ctx.merchants().recurring().isEmpty()) {
-            sb.append("  Recurring: ")
-                    .append(String.join(", ", ctx.merchants().recurring())).append("\n");
-        }
-        sb.append("\n");
-
-        // ── BEHAVIORAL SIGNALS — the key change ──────────────────────────────
-        // Feed the LLM pre-computed, evidence-backed facts.
-        // It narrates these. It does NOT invent additional patterns.
-        List<BehavioralSignal> firedSignals = ctx.signals().stream()
-                .filter(BehavioralSignal::isFired)
-                .sorted(Comparator.comparing(BehavioralSignal::getSeverity).reversed())
-                .collect(Collectors.toList());
-
-        if (!firedSignals.isEmpty()) {
-            sb.append("BEHAVIORAL SIGNALS (pre-computed — narrate these, do not add others)\n");
-            for (BehavioralSignal signal : firedSignals) {
-                sb.append("  [").append(signal.getSeverity()).append("] ")
-                        .append(signal.getSignalType().name()).append("\n");
-                if (signal.getEvidence() != null) {
-                    sb.append("    Evidence: ").append(signal.getEvidence()).append("\n");
-                }
-            }
-            sb.append("\n");
-        } else {
-            sb.append("BEHAVIORAL SIGNALS\n  No significant signals detected.\n\n");
-        }
-
-        // Financial health
-        sb.append("FINANCIAL HEALTH\n");
-        sb.append("  Score: ").append(ctx.healthScore().score())
-                .append("/100 (").append(ctx.healthScore().grade())
-                .append(" — ").append(ctx.healthScore().label()).append(")\n");
-        sb.append("  Burn rate: ").append(ctx.risk().burnRatePct()).append("% of income spent\n");
-        sb.append("  Savings rate: ").append(ctx.risk().savingsRate()).append("%\n");
-        if (!ctx.risk().spendingSpikes().isEmpty()) {
-            sb.append("  Spending spikes: ")
-                    .append(String.join(", ", ctx.risk().spendingSpikes())).append("\n");
-        }
-
-        List<String> flags = new ArrayList<>();
-        if (ctx.risk().overspending())    flags.add("overspending");
-        if (ctx.risk().noSavings())       flags.add("zero savings");
-        if (ctx.risk().highEmiPressure()) flags.add("high EMI burden");
-        sb.append("  Flags: ").append(flags.isEmpty() ? "none" : String.join(", ", flags))
-                .append("\n");
-
-        return sb.toString();
+        return new HealthScore(score, grade, label);
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -509,13 +496,11 @@ public class AIContextBuilderService {
     }
 
     private BigDecimal sum(List<Transaction> txs) {
-        return txs.stream().map(Transaction::getAmount)
-                .reduce(BigDecimal.ZERO, BigDecimal::add);
+        return txs.stream().map(Transaction::getAmount).reduce(BigDecimal.ZERO, BigDecimal::add);
     }
 
     private BigDecimal sumCategory(List<Transaction> txs, String category) {
-        return sum(txs.stream().filter(t -> category.equals(t.getCategory()))
-                .collect(Collectors.toList()));
+        return sum(txs.stream().filter(t -> category.equals(t.getCategory())).collect(Collectors.toList()));
     }
 
     private String resolvePeriodLabel(List<Transaction> txs) {
@@ -541,12 +526,27 @@ public class AIContextBuilderService {
         return null;
     }
 
+    /** Convert SNAKE_CASE enum name to a readable sentence fragment. */
+    private String humanize(String enumName) {
+        return enumName.replace("_", " ").toLowerCase();
+    }
+
+    private String incomeRangeLabel(UserOnboardingProfile.IncomeRange r) {
+        return switch (r) {
+            case BELOW_30K    -> "below ₹30,000/month";
+            case RANGE_30K_60K -> "₹30,000–₹60,000/month";
+            case RANGE_60K_1L  -> "₹60,000–₹1,00,000/month";
+            case RANGE_1L_2L   -> "₹1,00,000–₹2,00,000/month";
+            case ABOVE_2L      -> "above ₹2,00,000/month";
+        };
+    }
+
     private String fmt(BigDecimal val) {
         return val == null ? "0" : String.format("%,.0f", val);
     }
 
     // ─────────────────────────────────────────────────────────────────
-    // VALUE OBJECTS
+    // VALUE OBJECTS (unchanged)
     // ─────────────────────────────────────────────────────────────────
 
     public record AIContext(
@@ -554,7 +554,7 @@ public class AIContextBuilderService {
             IncomeProfile income,
             ExpenseProfile expenses,
             MerchantProfile merchants,
-            List<BehavioralSignal> signals,       // NEW — replaces BehaviorProfile
+            List<BehavioralSignal> signals,
             RiskProfile risk,
             HealthScore healthScore
     ) {
@@ -568,17 +568,16 @@ public class AIContextBuilderService {
             private RiskProfile risk;
             private HealthScore healthScore;
 
-            public Builder periodLabel(String v)       { this.periodLabel = v; return this; }
-            public Builder income(IncomeProfile v)     { this.income = v; return this; }
-            public Builder expenses(ExpenseProfile v)  { this.expenses = v; return this; }
-            public Builder merchants(MerchantProfile v){ this.merchants = v; return this; }
+            public Builder periodLabel(String v)            { this.periodLabel = v; return this; }
+            public Builder income(IncomeProfile v)          { this.income = v; return this; }
+            public Builder expenses(ExpenseProfile v)       { this.expenses = v; return this; }
+            public Builder merchants(MerchantProfile v)     { this.merchants = v; return this; }
             public Builder signals(List<BehavioralSignal> v){ this.signals = v; return this; }
-            public Builder risk(RiskProfile v)         { this.risk = v; return this; }
-            public Builder healthScore(HealthScore v)  { this.healthScore = v; return this; }
+            public Builder risk(RiskProfile v)              { this.risk = v; return this; }
+            public Builder healthScore(HealthScore v)       { this.healthScore = v; return this; }
 
             public AIContext build() {
-                return new AIContext(periodLabel, income, expenses, merchants,
-                        signals, risk, healthScore);
+                return new AIContext(periodLabel, income, expenses, merchants, signals, risk, healthScore);
             }
         }
     }

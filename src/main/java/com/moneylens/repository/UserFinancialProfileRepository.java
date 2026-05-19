@@ -1,5 +1,6 @@
 package com.moneylens.repository;
 
+import com.moneylens.entity.User;
 import com.moneylens.entity.UserFinancialProfile;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Query;
@@ -30,4 +31,7 @@ public interface UserFinancialProfileRepository extends JpaRepository<UserFinanc
      */
     @Query("DELETE FROM UserFinancialProfile p WHERE p.user.id = :userId")
     void deleteByUserId(@Param("userId") UUID userId);
+
+    Optional<UserFinancialProfile> findByUser(User user);
+
 }

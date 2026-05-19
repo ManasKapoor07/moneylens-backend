@@ -10,28 +10,8 @@ import org.springframework.transaction.annotation.Transactional;
 import jakarta.annotation.PostConstruct;
 import java.time.LocalDateTime;
 import java.util.List;
-import java.util.Optional;
 import java.util.concurrent.CopyOnWriteArrayList;
 
-/**
- * MerchantRegistry
- *
- * Single source of truth for merchant pattern → (normalizedName, category, confidence).
- *
- * Replaces:
- *   - TransactionMapper.KEYWORD_RULES  (static List<String[]>)
- *   - AIContextBuilderService.MERCHANT_ALIAS  (static Map<String, String>)
- *
- * Design:
- *   - All active rules are loaded into a CopyOnWriteArrayList at startup.
- *   - Lookups are O(n) linear scan — fast enough for a few hundred rules.
- *   - Cache is refreshed via refreshCache() after any write operation.
- *   - USER_CORRECTION rules have priority=0 so they always win over SEED (100).
- *
- * Usage:
- *   CategoryResult result = registry.resolve(narration, Transaction.Type.DEBIT);
- *   String cleanName      = registry.normalize(narration);
- */
 @Service
 public class MerchantRegistry {
 
@@ -39,11 +19,49 @@ public class MerchantRegistry {
 
     private final MerchantRuleRepository ruleRepository;
 
-    // In-memory cache — sorted by priority asc at load time.
     private final CopyOnWriteArrayList<MerchantRule> cache = new CopyOnWriteArrayList<>();
 
-    // Known service keywords used in P2P detection (populated from cache).
-    private volatile List<String> knownServicePatterns = List.of();
+    // ── Known merchant VPA suffixes / prefixes that appear in UPI strings ─────
+    // These are NOT P2P even though they come through UPI
+    private static final List<String> KNOWN_MERCHANT_SIGNALS = List.of(
+            // Food
+            "zomato", "swiggy", "blinkit", "zepto", "dunzo", "magicpin",
+            "eatsure", "faasos", "behrouz", "box8", "freshmenu", "lunchbox",
+            // E-commerce
+            "amazon", "flipkart", "meesho", "myntra", "ajio", "nykaa",
+            "snapdeal", "shopsy", "glowroad", "mamaearth",
+            // Streaming / subscriptions
+            "netflix", "spotify", "hotstar", "disneyplus", "disney",
+            "primevideo", "prime", "jiocinema", "sonyliv", "zee5",
+            "youtube", "apple", "google", "microsoft",
+            // Travel
+            "irctc", "redbus", "makemytrip", "goibibo", "cleartrip",
+            "ixigo", "easemytrip", "abhibus", "yatra",
+            // Ride / delivery
+            "uber", "ola", "rapido", "indriver", "blusmart",
+            "zomato", "swiggy", "dunzo",
+            // Fuel
+            "petrol", "diesel", "hpcl", "bpcl", "iocl", "indianoil", "hp pump",
+            // Utilities
+            "bescom", "msedcl", "bses", "tata power", "adani electric",
+            "airtel", "jio", "bsnl", "vodafone", "vi ", "ideacellular",
+            // Finance
+            "lic", "hdfc life", "icici pru", "sbi life", "max life",
+            "bajaj allianz", "star health", "niacl",
+            // Payments / wallets (merchant-side, not personal)
+            "billdesk", "razorpay", "cashfree", "payu", "instamojo",
+            // Grocery / retail
+            "bigbasket", "jiomart", "dmart", "reliance", "more supermarket",
+            "spencers", "lulu", "star bazaar",
+            // Health
+            "apollo", "medplus", "1mg", "netmeds", "pharmeasy", "practo",
+            // Education
+            "byju", "unacademy", "vedantu", "coursera", "udemy",
+            // Gaming
+            "mpl", "dream11", "gamezy", "winzo",
+            // Misc merchants
+            "bookmyshow", "pvr", "inox", "paytm mall"
+    );
 
     public MerchantRegistry(MerchantRuleRepository ruleRepository) {
         this.ruleRepository = ruleRepository;
@@ -57,32 +75,26 @@ public class MerchantRegistry {
         log.info("MerchantRegistry initialised — {} active rules loaded", cache.size());
     }
 
-    /**
-     * Reload all active rules from DB into the in-memory cache.
-     * Call this after any write (add / deactivate / correction).
-     */
     public synchronized void refreshCache() {
         List<MerchantRule> fresh = ruleRepository.findAllActiveOrderByPriority();
         cache.clear();
         cache.addAll(fresh);
-        // Rebuild the known-services list for P2P detection
-        knownServicePatterns = fresh.stream()
-                .map(MerchantRule::getPattern)
-                .toList();
         log.debug("MerchantRegistry cache refreshed — {} rules", cache.size());
     }
 
     // ── Primary API ───────────────────────────────────────────────────────────
 
     /**
-     * Resolve a raw bank narration string to a CategoryResult.
+     * Resolve a raw bank narration to a CategoryResult.
      *
      * Strategy (in order):
-     *   1. Credit-side income signals (salary, refund, interest…)
+     *   1. Credit-side income signals
      *   2. Registry pattern scan (first match wins, priority-ordered)
-     *   3. P2P heuristic (UPI to individual, no merchant matched)
-     *   4. Generic bank transfer (NEFT/RTGS/IMPS)
-     *   5. Fallback → Other
+     *   3. P2P heuristic (UPI to individual)
+     *   4. Generic bank transfer (NEFT / RTGS / IMPS)
+     *   5. UPI catch-all (anything UPI not yet classified → P2P Transfer)
+     *   6. HDFC collection edge case
+     *   7. Fallback → Other
      */
     public CategoryResult resolve(String narration, com.moneylens.entity.Transaction.Type type) {
         if (narration == null || narration.isBlank()) return CategoryResult.fallback();
@@ -122,22 +134,21 @@ public class MerchantRegistry {
                 || lo.contains("trf") || lo.contains("transfer"))
             return CategoryResult.bankTransfer();
 
-        // ── Step 5: HDFC collection catch ────────────────────────────────────
+        // ── Step 5: UPI catch-all ─────────────────────────────────────────────
+        // Any UPI string that wasn't caught by a rule, P2P heuristic, or bank
+        // transfer is still more accurately P2P Transfer than Other.
+        if (lo.contains("upi")) return CategoryResult.p2pHeuristic();
+
+        // ── Step 6: HDFC collection edge case ─────────────────────────────────
         if (lo.contains("collec") && lo.contains("hdfc"))
             return new CategoryResult("Merchant Payment", null, 0.65, "RULE");
 
+        // ── Step 7: Fallback ──────────────────────────────────────────────────
         return CategoryResult.fallback();
     }
 
     /**
      * Normalize a raw narration to a clean merchant display name.
-     *
-     * First checks the registry for a match and returns its normalizedName.
-     * Falls back to the heuristic token extractor for unknown merchants.
-     *
-     * Replaces:
-     *   - AIContextBuilderService.normalizeMerchant()
-     *   - TransactionMapper.cleanMerchant()
      */
     public String normalize(String narration) {
         if (narration == null) return "Unknown";
@@ -154,13 +165,6 @@ public class MerchantRegistry {
 
     // ── Write operations ──────────────────────────────────────────────────────
 
-    /**
-     * Record a user correction.
-     *
-     * If a USER_CORRECTION rule already exists for this exact pattern, update it.
-     * Otherwise, insert a new rule with priority=0 (beats all SEED rules).
-     * Refreshes the cache after saving.
-     */
     @Transactional
     public MerchantRule recordUserCorrection(
             String pattern,
@@ -173,7 +177,6 @@ public class MerchantRegistry {
         MerchantRule rule = ruleRepository
                 .findByPatternAndActiveTrue(lowerPattern)
                 .map(existing -> {
-                    // Update existing rule
                     existing.setNormalizedName(normalizedName);
                     existing.setCategory(category);
                     existing.setSubCategory(subCategory);
@@ -193,9 +196,6 @@ public class MerchantRegistry {
         return saved;
     }
 
-    /**
-     * Soft-delete a rule by ID (deactivates, does not remove).
-     */
     @Transactional
     public void deactivate(Long ruleId) {
         ruleRepository.findById(ruleId).ifPresent(rule -> {
@@ -207,14 +207,10 @@ public class MerchantRegistry {
         });
     }
 
-    // ── Inspection ────────────────────────────────────────────────────────────
-
-    /** Returns a snapshot of the current in-memory cache (read-only). */
     public List<MerchantRule> getCachedRules() {
         return List.copyOf(cache);
     }
 
-    /** How many active rules are loaded. */
     public int size() {
         return cache.size();
     }
@@ -222,19 +218,40 @@ public class MerchantRegistry {
     // ── Private helpers ───────────────────────────────────────────────────────
 
     /**
-     * P2P heuristic: UPI transfer to an individual (no known merchant matched).
-     * A transaction is P2P if:
-     *   - description contains "upi"
-     *   - AND none of the known merchant patterns matched (already checked above)
-     *   - AND it looks like a person-to-account transfer (p2a/p2p prefix, or @handle)
+     * P2P heuristic.
+     *
+     * A UPI transaction is P2P when:
+     *   - No registry rule matched (already checked in resolve())
+     *   - AND it looks like a person-to-account transfer
+     *
+     * Guard: if the description contains a known merchant signal, it is NOT P2P
+     * even if no rule matched — prevents unknown merchants landing in P2P.
+     * Those will fall through to the UPI catch-all at Step 5 with p2pHeuristic
+     * since P2P Transfer is still better than Other for unrecognized UPI.
      */
     private boolean isP2P(String lower) {
         if (!lower.contains("upi")) return false;
-        // At this point no registry rule matched, so we know it's not a known merchant.
-        // Check for person-to-account signals.
-        return lower.contains("p2a")
-                || lower.contains("/p2p/")
-                || lower.matches(".*upi.*/[a-z]{2,}@.*");
+
+        // If it mentions a known merchant, it's not P2P — skip to catch-all
+        for (String signal : KNOWN_MERCHANT_SIGNALS) {
+            if (lower.contains(signal)) return false;
+        }
+
+        // Explicit P2P type indicators in description
+        if (lower.contains("p2a") || lower.contains("p2p") || lower.contains("p2m")) return true;
+
+        // VPA / @handle pattern — person transfer
+        // Matches: name@okaxis, phone@paytm, 9876543210@upi, xyz@ybl
+        if (lower.matches(".*\\b[a-z0-9._%+\\-]{3,}@[a-z]{2,}\\b.*")) return true;
+
+        // 10-digit mobile number in description — person transfer
+        if (lower.matches(".*\\b[6-9]\\d{9}\\b.*")) return true;
+
+        // UPI with a person name pattern after slash — UPI/DR/refno/FirstName LastName/BANK
+        // Catches: "upi/dr/123456/rahul kumar/sbin/0"
+        if (lower.matches(".*upi/[a-z]{2,4}/\\d+/[a-z ]{3,}/.*")) return true;
+
+        return false;
     }
 
     /**
@@ -244,32 +261,52 @@ public class MerchantRegistry {
      */
     private String extractFallbackName(String raw) {
         String s = raw
-                .replaceAll("(?i)UPI/P2[AMP]/\\d+/", " ")
-                .replaceAll("(?i)UPI/P2[AMP]/",       " ")
-                .replaceAll("(?i)/UPIInt/",            " ")
-                .replaceAll("(?i)/Collec/",            " ")
-                .replaceAll("(?i)/Sent u/",            " ")
-                .replaceAll("(?i)/Pay to/",            " ")
-                .replaceAll("(?i)TRF/",                " ")
-                .replaceAll("@[^\\s/]+",               " ")
-                .replaceAll("/[A-Z]{2,4} BANK.*",      " ")
-                .replaceAll("/[A-Z]{2,}$",             " ")
-                .replaceAll("\\b\\d{6,}\\b",           " ")
-                .replaceAll("[^a-zA-Z\\s]",            " ")
-                .replaceAll("\\s+",                    " ")
+                // UPI structural prefixes
+                .replaceAll("(?i)UPI/P2[AMP]/\\d+/",   " ")
+                .replaceAll("(?i)UPI/P2[AMP]/",         " ")
+                .replaceAll("(?i)UPI/DR/\\d+/",         " ")
+                .replaceAll("(?i)UPI/CR/\\d+/",         " ")
+                .replaceAll("(?i)UPI/",                  " ")
+                .replaceAll("(?i)/UPIInt/",              " ")
+                .replaceAll("(?i)/Collec/",              " ")
+                .replaceAll("(?i)/Sent u/",              " ")
+                .replaceAll("(?i)/Pay to/",              " ")
+                .replaceAll("(?i)TRF/",                  " ")
+                // Wallet / app prefixes
+                .replaceAll("(?i)PHONEPE[-/]",           " ")
+                .replaceAll("(?i)GPAY[-/]",              " ")
+                .replaceAll("(?i)PAYTM[-/]",             " ")
+                .replaceAll("(?i)BHIM[-/]",              " ")
+                // VPA handles and bank codes
+                .replaceAll("@[^\\s/]+",                 " ")
+                .replaceAll("/[A-Z]{2,4} BANK.*",        " ")
+                .replaceAll("/[A-Z]{2,}$",               " ")
+                // Reference numbers (6+ digits)
+                .replaceAll("\\b\\d{6,}\\b",             " ")
+                // Non-alpha
+                .replaceAll("[^a-zA-Z\\s]",              " ")
+                .replaceAll("\\s+",                      " ")
                 .trim();
 
         String[] parts = s.split("\\s+");
         StringBuilder out = new StringBuilder();
         int words = 0;
+
+        // Skip common noise words
+        List<String> SKIP = List.of("upi", "neft", "rtgs", "imps", "trf", "transfer",
+                "dr", "cr", "to", "by", "from", "via", "net", "banking", "bank", "paid");
+
         for (String p : parts) {
             if (p.length() <= 1) continue;
+            if (SKIP.contains(p.toLowerCase())) continue;
             if (!out.isEmpty()) out.append(" ");
             out.append(Character.toUpperCase(p.charAt(0)))
                     .append(p.substring(1).toLowerCase());
             if (++words == 3) break;
         }
-        return !out.isEmpty() ? out.toString()
+
+        return !out.isEmpty()
+                ? out.toString()
                 : raw.substring(0, Math.min(raw.length(), 25));
     }
 }
